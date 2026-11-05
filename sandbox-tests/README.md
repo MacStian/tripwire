@@ -119,22 +119,41 @@ policy burns more than the mocks here.
 | `agent.<master>` | 0.5 | 0.50 |
 | `vendor.<master>` | 0.1 | 0.10 |
 
-With 0.1 NEAR for the gas of the account creations the master needs 14 NEAR. `tests/deploy.rs`
-checks these numbers on a local node.
+With 0.1 NEAR for the gas of the account creations the master needs 14 NEAR it can spend, on
+top of the stake for its own storage. `tests/deploy.rs` checks these numbers on a local node.
 
 1. Create the master account and put its key in the near CLI legacy keychain, at
    `~/.near-credentials/testnet/<master>.json`.
-2. Fund it with 14 testnet NEAR.
-3. Run `scripts/deploy-testnet.sh <master>`, for example `scripts/deploy-testnet.sh tripwire-demo.testnet`.
+2. Fund it with 14 testnet NEAR. A fresh account needs nothing more. An account with a contract
+   or other state needs its storage stake on top.
+3. Run `scripts/deploy-testnet.sh <master>` on Linux or macOS (WSL on Windows), for example
+   `scripts/deploy-testnet.sh tripwire-demo.testnet`. The deploy refuses to run elsewhere,
+   because it cannot make the key files readable by the owner only there.
 
-The script stops before it sends anything when the master holds too little NEAR, when one of
-the six accounts already exists or when a key file it would write is already there. It writes:
+Before it sends anything the script builds both contracts and stops when a build fails, when one
+of the six accounts already exists, when a key file it would write is already there or when the
+master can spend too little NEAR. Only the RPC's `UNKNOWN_ACCOUNT` answer counts as a missing
+account, so an RPC that times out or fails stops the deploy too. Then it writes both key files,
+readable by the owner only and synced to disk, and only then creates the accounts. It writes:
 
-- `deployments/testnet.json`: accounts, code hashes, the agent's public key and its limits, the
-  guard policy and explorer links. No secrets, safe to commit.
 - `~/.near-credentials/testnet/agent.<master>.json`: the agent's function call key, for the
   agent process. It reaches only `request_payment` on the guard.
-- `~/.near-credentials/testnet/council.<master>.json`: the council key, for the votes in the
-  demo.
+- `~/.near-credentials/testnet/council.<master>.json`: a full access key of the council's own,
+  for the votes in the demo. It reaches only the council account, not the master.
+- `deployments/testnet.json`: accounts, code hashes, the agent's public key and its limits, the
+  guard policy and explorer links. No secrets, safe to commit. The script writes it last.
 
 `NEAR_RPC_URL` and `NEAR_CREDENTIALS_DIR` override the RPC endpoint and the key directory.
+
+### When a deploy stops partway
+
+The script does not resume. The accounts it already created stay on testnet and the two key
+files stay in the keychain. To start over:
+
+1. Delete `agent.<master>.json` and `council.<master>.json` from the keychain.
+2. Run the script under a new master account.
+
+To get the NEAR back, delete the subaccounts that exist with the near CLI, signing with the
+master key, which every subaccount except the guard still holds. The guard has no keys once
+`lock_guard` ran, so its NEAR stays there. A deploy that finished but could not write its
+summary leaves a working setup: the accounts are those in the table, under `<master>`.

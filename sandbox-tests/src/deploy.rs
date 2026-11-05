@@ -2,15 +2,17 @@
 //!
 //! [`run`] creates the same accounts and contracts as the sandbox tests under a master account
 //! you own, writes the key files the demo needs next to the master key file and returns a
-//! summary for `deployments/<network>.json`. It stops before creating anything when the master
-//! holds too little NEAR, when an account it would create already exists or when a key file it
-//! would write is already there.
+//! summary for `deployments/<network>.json`. Before it sends anything it builds both contracts,
+//! writes the key files and stops when an account it would create already exists, when a key
+//! file it would write is already there or when the master cannot spend enough NEAR.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{ensure, Context, Result};
-use near_api::{Account, AccountId, NearToken, NetworkConfig, Signer};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use near_api::signer::generate_secret_key;
+use near_api::types::AccessKeyPermission;
+use near_api::{AccountId, NearToken, NetworkConfig, Signer};
 use serde_json::{json, Map, Value};
 
 use crate::{Deployment, Options, AGENT_KEY_ALLOWANCE, SPUTNIK_COMMIT};
@@ -19,7 +21,7 @@ use crate::{Deployment, Options, AGENT_KEY_ALLOWANCE, SPUTNIK_COMMIT};
 /// creations. Every other transaction is signed, and paid for, by the account it acts as.
 pub const GAS_MARGIN: NearToken = NearToken::from_millinear(100);
 
-/// NEAR the master needs for [`run`].
+/// NEAR the master must be able to spend for [`run`], on top of the stake for its own storage.
 pub fn required_balance(opts: &Options) -> NearToken {
     opts.balances.total().saturating_add(GAS_MARGIN)
 }
@@ -31,42 +33,53 @@ pub fn key_file(credentials: &Path, id: &AccountId) -> PathBuf {
 
 /// Deploys under `master`, signing with its key file in `credentials`.
 ///
-/// Writes two key files to `credentials`: the agent's function call key, for the agent
-/// process, and the council's full access key, for the votes in the demo. The council key is
-/// the master key, like on every account the setup creates.
+/// Writes two key files to `credentials` before it sends anything: the agent's function call
+/// key, for the agent process, and a full access key of the council's own, for the votes in
+/// the demo. The council key reaches only the council account. The master key stays on every
+/// account the setup creates except the guard.
 pub async fn run(
     network: NetworkConfig,
     master: AccountId,
     credentials: &Path,
     opts: Options,
 ) -> Result<(Deployment, Value)> {
+    ensure!(
+        cfg!(unix),
+        "run the deploy on Linux or macOS (WSL on Windows), where the key files it writes can \
+         be made readable by the owner only"
+    );
     let master_file = key_file(credentials, &master);
     let signer = Signer::from_access_keyfile(master_file.clone())
         .with_context(|| format!("reading the master key {}", master_file.display()))?;
-    let master_keys: Value = serde_json::from_str(&std::fs::read_to_string(&master_file)?)?;
 
-    let accounts = Deployment::account_names(&master)?;
-    for id in &accounts {
-        let existing = Account(id.clone()).view().fetch_from(&network).await;
-        ensure!(existing.is_err(), "{id} already exists, deploy under another master account");
+    // A failed build must not leave funded accounts behind, so build before anything is sent.
+    // The builds panic with the cargo near output.
+    std::panic::catch_unwind(crate::guard_wasm)
+        .map_err(|_| anyhow!("building the guard failed, nothing was sent"))?;
+    std::panic::catch_unwind(crate::mock_ft_wasm)
+        .map_err(|_| anyhow!("building the mock token failed, nothing was sent"))?;
+
+    let deployment = Deployment::new(network, master, signer, opts.proposal_bond)?;
+    for id in Deployment::account_names(&deployment.master)? {
+        let exists = account_exists(&deployment.network, &id).await?;
+        ensure!(!exists, "{id} already exists, deploy under another master account");
     }
-    let [council, _, _, _, agent, _] = &accounts;
-    let agent_file = key_file(credentials, agent);
-    let council_file = key_file(credentials, council);
+    let agent_file = key_file(credentials, &deployment.agent);
+    let council_file = key_file(credentials, &deployment.council);
     for file in [&agent_file, &council_file] {
         ensure!(!file.exists(), "{} already exists", file.display());
     }
-    let balance = Account(master.clone())
-        .view()
-        .fetch_from(&network)
-        .await
-        .with_context(|| format!("reading {master}"))?
-        .data
-        .amount;
+    let spendable = deployment.spendable(&deployment.master).await?;
     let needed = required_balance(&opts);
-    ensure!(balance >= needed, "{master} holds {balance}, the setup needs {needed}");
+    ensure!(
+        spendable >= needed,
+        "{} can spend {spendable}, the setup needs {needed}",
+        deployment.master
+    );
 
-    let deployment = Deployment::create(network, master, signer, opts).await?;
+    // Keys first, so a failure later cannot lose one.
+    let council_secret = generate_secret_key()?;
+    let council_key = council_secret.public_key();
     write_key_file(
         &agent_file,
         &deployment.agent,
@@ -76,14 +89,53 @@ pub async fn run(
     write_key_file(
         &council_file,
         &deployment.council,
-        master_keys["public_key"].as_str().context("no public_key in the master key file")?,
-        master_keys["private_key"].as_str().context("no private_key in the master key file")?,
+        &council_key.to_string(),
+        &council_secret.to_string(),
     )?;
-    let summary = summary(&deployment, &opts).await?;
+
+    async {
+        deployment.create_accounts(&opts.balances).await?;
+        deployment.set_up(&opts).await?;
+        deployment.add_key(&deployment.council, AccessKeyPermission::FullAccess, council_key).await
+    }
+    .await
+    .context(
+        "the deploy stopped partway, see the Testnet section of sandbox-tests/README.md to clean up",
+    )?;
+
+    let summary = summary(&deployment, &opts)
+        .await
+        .context("the deploy finished, but reading its summary failed")?;
     Ok((deployment, summary))
 }
 
-/// Writes a key file in the near CLI format, readable by the owner only. Never overwrites.
+/// Whether `id` exists, at final finality. Only the RPC's `UNKNOWN_ACCOUNT` counts as missing.
+/// Every other answer, a timeout or an RPC error, is an error.
+pub async fn account_exists(network: &NetworkConfig, id: &AccountId) -> Result<bool> {
+    let rpc = network.rpc_endpoints.first().context("no RPC endpoint")?;
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "tripwire",
+        "method": "query",
+        "params": { "request_type": "view_account", "finality": "final", "account_id": id },
+    });
+    let response: Value = async {
+        let response = reqwest::Client::new().post(rpc.url.clone()).json(&request).send().await?;
+        response.error_for_status()?.json().await
+    }
+    .await
+    .with_context(|| format!("checking whether {id} exists"))?;
+    if response["result"].is_object() {
+        return Ok(true);
+    }
+    if response["error"]["cause"]["name"] == "UNKNOWN_ACCOUNT" {
+        return Ok(false);
+    }
+    bail!("checking whether {id} exists failed: {response}")
+}
+
+/// Writes a key file in the near CLI format, readable by the owner only, and syncs it to disk.
+/// Never overwrites.
 fn write_key_file(path: &Path, id: &AccountId, public_key: &str, private_key: &str) -> Result<()> {
     let body = json!({ "account_id": id, "public_key": public_key, "private_key": private_key });
     let mut options = std::fs::OpenOptions::new();
@@ -92,6 +144,7 @@ fn write_key_file(path: &Path, id: &AccountId, public_key: &str, private_key: &s
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(path).with_context(|| format!("creating {}", path.display()))?;
     file.write_all(serde_json::to_string(&body)?.as_bytes())?;
+    file.sync_all().with_context(|| format!("syncing {}", path.display()))?;
     Ok(())
 }
 

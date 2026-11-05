@@ -56,6 +56,9 @@ pub const AGENT_KEY_ALLOWANCE: NearToken = NearToken::from_millinear(250);
 /// Gas the agent attaches to `request_payment` in the scenario tests.
 pub const AGENT_GAS: NearGas = NearGas::from_tgas(100);
 
+/// Storage stake: 1 NEAR per 100 kB.
+pub const STORAGE_PRICE_PER_BYTE: u128 = 10u128.pow(19);
+
 const STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(10);
 const NO_DEPOSIT: NearToken = NearToken::from_yoctonear(0);
 
@@ -313,11 +316,17 @@ impl Deployment {
         opts: Options,
     ) -> Result<Self> {
         let deployment = Self::new(network, master, signer, opts.proposal_bond)?;
-        for (id, balance) in deployment.balances(&opts.balances) {
-            deployment.create_subaccount(id, balance).await?;
-        }
+        deployment.create_accounts(&opts.balances).await?;
         deployment.set_up(&opts).await?;
         Ok(deployment)
+    }
+
+    /// Step 1 of [`Deployment::create`]: the six subaccounts, funded by the master.
+    pub async fn create_accounts(&self, balances: &Balances) -> Result<()> {
+        for (id, balance) in self.balances(balances) {
+            self.create_subaccount(id, balance).await?;
+        }
+        Ok(())
     }
 
     /// The account ids under `master` and a new agent key. Sends nothing.
@@ -482,12 +491,22 @@ impl Deployment {
             receiver_id: self.guard.to_string(),
             method_names: vec!["request_payment".to_string()],
         });
-        let result = Account(self.agent.clone())
-            .add_key(permission, self.agent_key)
+        self.add_key(&self.agent, permission, self.agent_key).await
+    }
+
+    /// Adds `key` to `id`, signing with the master key the account holds.
+    pub async fn add_key(
+        &self,
+        id: &AccountId,
+        permission: AccessKeyPermission,
+        key: PublicKey,
+    ) -> Result<()> {
+        let result = Account(id.clone())
+            .add_key(permission, key)
             .with_signer(self.signer.clone())
             .send_to(&self.network)
             .await?;
-        check(&full(result)?, "adding the agent key")
+        check(&full(result)?, &format!("adding a key to {id}"))
     }
 
     async fn deploy(&self, id: &AccountId, wasm: &[u8], init_args: Value) -> Result<()> {
@@ -769,6 +788,19 @@ impl Deployment {
     /// Id the DAO gives the next proposal.
     pub async fn next_proposal_id(&self) -> Result<u64> {
         self.view(&self.dao, "get_last_proposal_id", json!({})).await
+    }
+
+    /// NEAR the account can spend: its balance less the stake for its storage. It leaves out the
+    /// storage exemption of small accounts, so it errs low.
+    pub async fn spendable(&self, id: &AccountId) -> Result<NearToken> {
+        let view = Account(id.clone())
+            .view()
+            .fetch_from(&self.network)
+            .await
+            .with_context(|| format!("reading {id}"))?
+            .data;
+        let stake = u128::from(view.storage_usage) * STORAGE_PRICE_PER_BYTE;
+        Ok(NearToken::from_yoctonear(view.amount.as_yoctonear().saturating_sub(stake)))
     }
 
     /// Bytes of storage the account uses.
