@@ -15,6 +15,7 @@ impl Guard {
     /// restores the budget, the period counters of the request's period and the request id,
     /// so the agent can retry with the same id once the cause is fixed.
     #[private]
+    #[allow(clippy::too_many_arguments)]
     pub fn on_payout_complete(
         &mut self,
         request_id: String,
@@ -22,6 +23,7 @@ impl Guard {
         recipient: AccountId,
         token_id: TokenKey,
         amount: U128,
+        spent_in_period: U128,
         period_start: u64,
     ) -> PaymentOutcome {
         // A real callback always has the one result of the transfer it is chained to.
@@ -30,7 +32,6 @@ impl Guard {
             env::panic_str("ERR_NOT_A_CALLBACK");
         };
         if succeeded {
-            let spent_in_period = U128(self.spent_in_period(&token_id));
             Event::PaymentExecuted {
                 request_id: request_id.clone(),
                 agent,
@@ -73,6 +74,9 @@ impl Guard {
         self.debit(&token_id, amount.0);
         let mut usage = self.token_usage_now(&token_id);
         usage.spent_in_period = U128(usage.spent_in_period.0.saturating_add(amount.0));
+        // Taken now, so the event reports the period of the payment even when the callback
+        // runs after the period has ended.
+        let spent_in_period = usage.spent_in_period;
         self.token_usage.insert(token_id.clone(), usage);
 
         // New entries must count in the storage the reserve check sees. LookupSet writes
@@ -96,6 +100,7 @@ impl Guard {
                 recipient,
                 token_id,
                 amount,
+                spent_in_period,
                 period_start,
             ),
         )

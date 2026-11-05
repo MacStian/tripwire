@@ -42,6 +42,7 @@ fn complete(
     request_id: &str,
     token_id: TokenKey,
     amount: u128,
+    spent_in_period: u128,
     period_start: u64,
 ) -> PaymentOutcome {
     guard.on_payout_complete(
@@ -50,6 +51,7 @@ fn complete(
         acc(HOSTING),
         token_id,
         U128(amount),
+        U128(spent_in_period),
         period_start,
     )
 }
@@ -98,6 +100,7 @@ fn pays_usdc_with_a_plain_ft_transfer_and_a_callback() {
             "recipient": HOSTING,
             "token_id": USDC,
             "amount": "100000000",
+            "spent_in_period": "100000000",
             "period_start": start,
         })
     );
@@ -128,7 +131,7 @@ fn success_emits_payment_executed() {
     request(&mut guard, "inv-101", Some(usdc()), 100_000_000);
 
     callback_with(PromiseResult::Successful(vec![]));
-    let outcome = complete(&mut guard, "inv-101", Some(usdc()), 100_000_000, start);
+    let outcome = complete(&mut guard, "inv-101", Some(usdc()), 100_000_000, 100_000_000, start);
     assert_eq!(outcome, PaymentOutcome::Paid { request_id: "inv-101".to_string() });
 
     let status = usdc_status(&guard);
@@ -157,7 +160,7 @@ fn failure_restores_the_budget_the_counters_and_the_request_id() {
     request(&mut guard, "inv-101", Some(usdc()), 100_000_000);
 
     callback_with(PromiseResult::Failed);
-    let outcome = complete(&mut guard, "inv-101", Some(usdc()), 100_000_000, start);
+    let outcome = complete(&mut guard, "inv-101", Some(usdc()), 100_000_000, 100_000_000, start);
     assert_eq!(outcome, PaymentOutcome::PaymentFailed { request_id: "inv-101".to_string() });
 
     let status = usdc_status(&guard);
@@ -190,7 +193,7 @@ fn failed_near_payout_restores_the_near_budget() {
     request(&mut guard, "inv-101", None, NEAR);
 
     callback_with(PromiseResult::Failed);
-    complete(&mut guard, "inv-101", None, NEAR, start);
+    complete(&mut guard, "inv-101", None, NEAR, NEAR, start);
     assert_eq!(guard.get_status().near_budget, U128(3 * NEAR));
     assert_eq!(guard.get_token_status(None).unwrap().spent_in_period, U128(0));
 }
@@ -206,7 +209,7 @@ fn failure_after_the_period_ended_leaves_the_new_period_alone() {
     request(&mut guard, "inv-102", Some(usdc()), 50_000_000);
 
     callback_at(PromiseResult::Failed, new_start);
-    complete(&mut guard, "inv-101", Some(usdc()), 100_000_000, old_start);
+    complete(&mut guard, "inv-101", Some(usdc()), 100_000_000, 100_000_000, old_start);
     let status = usdc_status(&guard);
     assert_eq!(status.budget, U128(450_000_000));
     assert_eq!(status.spent_in_period, U128(50_000_000));
@@ -221,7 +224,49 @@ fn a_direct_call_without_a_promise_result_panics() {
     let start = guard.current_period_start();
     request(&mut guard, "inv-101", Some(usdc()), 100_000_000);
     call_as(GUARD);
-    complete(&mut guard, "inv-101", Some(usdc()), 100_000_000, start);
+    complete(&mut guard, "inv-101", Some(usdc()), 100_000_000, 100_000_000, start);
+}
+
+#[test]
+fn payment_executed_reports_the_period_of_the_payment() {
+    // Paid just before the period ends, confirmed after it: the event still shows the total
+    // of the period the payment counts in.
+    let mut guard = funded_guard();
+    let start = guard.current_period_start();
+    request(&mut guard, "inv-101", Some(usdc()), 100_000_000);
+
+    callback_at(PromiseResult::Successful(vec![]), start + policy().period_seconds);
+    complete(&mut guard, "inv-101", Some(usdc()), 100_000_000, 100_000_000, start);
+    assert_eq!(usdc_status(&guard).spent_in_period, U128(0));
+    assert_eq!(only_event()["data"]["spent_in_period"], "100000000");
+}
+
+#[test]
+fn two_payouts_in_flight_one_fails_and_one_succeeds() {
+    let mut guard = funded_guard();
+    let start = guard.current_period_start();
+    request(&mut guard, "inv-1", Some(usdc()), 100_000_000);
+    call_as(AGENT);
+    request(&mut guard, "inv-2", Some(usdc()), 50_000_000);
+    assert_eq!(usdc_status(&guard).budget, U128(350_000_000));
+    assert_eq!(payments(&guard), 2);
+
+    callback_with(PromiseResult::Failed);
+    complete(&mut guard, "inv-1", Some(usdc()), 100_000_000, 100_000_000, start);
+    callback_with(PromiseResult::Successful(vec![]));
+    let outcome = complete(&mut guard, "inv-2", Some(usdc()), 50_000_000, 150_000_000, start);
+    assert_eq!(outcome, PaymentOutcome::Paid { request_id: "inv-2".to_string() });
+
+    // Only the failed payout is rolled back.
+    let status = usdc_status(&guard);
+    assert_eq!(status.budget, U128(450_000_000));
+    assert_eq!(status.spent_in_period, U128(50_000_000));
+    assert_eq!(payments(&guard), 1);
+    assert!(!guard.is_request_processed("inv-1".to_string()));
+    assert!(guard.is_request_processed("inv-2".to_string()));
+    let event = only_event();
+    assert_eq!(event["event"], "payment_executed");
+    assert_eq!(event["data"]["request_id"], "inv-2");
 }
 
 #[test]

@@ -44,7 +44,9 @@ pub struct Policy {
     pub max_escalations_per_period: u32,
     /// Must equal the DAO's own proposal bond exactly.
     pub proposal_bond: NearToken,
-    /// NEAR that always stays on the guard for storage, deposits and bonds.
+    /// Floor of NEAR that always stays on the guard on top of `near_budget`. Bonds, 1 yoctoNEAR
+    /// deposits and new storage are paid from NEAR above this floor (`free_reserve` in
+    /// `get_status`), so fund the guard with storage + reserve + budget + room for bonds.
     pub min_near_reserve: NearToken,
 }
 
@@ -87,6 +89,10 @@ pub fn validate_policy(policy: &Policy, now_sec: u64, guard_id: &AccountId) {
         || has_duplicates(policy.token_limits.iter().map(|l| &l.token_id))
     {
         invalid("duplicates");
+    }
+    // An agent that may also be paid could pay itself with a leaked key, up to the caps.
+    if policy.agents.iter().any(|agent| policy.is_recipient(agent)) {
+        invalid("agent in recipients");
     }
     for limit in &policy.token_limits {
         if limit.max_per_payment.0 == 0 || limit.max_per_payment.0 > limit.max_per_period.0 {
