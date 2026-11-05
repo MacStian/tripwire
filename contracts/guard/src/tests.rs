@@ -5,6 +5,7 @@ use super::*;
 
 mod funding;
 mod governance;
+mod request;
 
 const NOW_SEC: u64 = 1_762_300_000;
 const GUARD: &str = "guard.test.near";

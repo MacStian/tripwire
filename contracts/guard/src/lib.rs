@@ -9,9 +9,11 @@ pub mod events;
 mod funding;
 mod governance;
 mod policy;
+mod request;
 
 pub use funding::Withdrawal;
 pub use policy::*;
+pub use request::*;
 
 use near_sdk::json_types::U128;
 use near_sdk::store::{LookupMap, LookupSet};
@@ -136,11 +138,7 @@ impl Guard {
     /// `None` when the token is not in the policy.
     pub fn get_token_status(&self, token_id: TokenKey) -> Option<TokenStatus> {
         let limit = self.policy.token_limit(&token_id)?;
-        let spent = self
-            .token_usage
-            .get(&token_id)
-            .map(|u| u.rolled(self.current_period_start()).spent_in_period.0)
-            .unwrap_or(0);
+        let spent = self.spent_in_period(&token_id);
         Some(TokenStatus {
             budget: U128(self.budget_of(&token_id)),
             max_per_payment: limit.max_per_payment,
@@ -177,6 +175,19 @@ impl Guard {
 
     fn current_period_start(&self) -> u64 {
         current_period_start(now_sec(), self.policy.period_anchor, self.policy.period_seconds)
+    }
+
+    /// Spending of `token_id` in the current period. A finished period reads as zero.
+    fn token_usage_now(&self, token_id: &TokenKey) -> PeriodUsage {
+        let start = self.current_period_start();
+        self.token_usage
+            .get(token_id)
+            .map(|u| u.rolled(start))
+            .unwrap_or(PeriodUsage { period_start: start, spent_in_period: U128(0) })
+    }
+
+    fn spent_in_period(&self, token_id: &TokenKey) -> u128 {
+        self.token_usage_now(token_id).spent_in_period.0
     }
 
     fn budget_of(&self, token_id: &TokenKey) -> u128 {
