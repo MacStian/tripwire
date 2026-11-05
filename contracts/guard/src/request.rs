@@ -7,8 +7,9 @@ use crate::{now_sec, Guard, GuardExt, TokenKey};
 
 pub const MAX_REQUEST_ID_LEN: usize = 64;
 
-/// Starting point until the sandbox gas tests (E2-S2) set the final value. Covers the outgoing
-/// call (`ft_transfer` or `add_proposal`) plus its callback, with a clear error when too low.
+/// Covers twice the gas of the request itself plus the static gas of the outgoing call
+/// (`ft_transfer` or `add_proposal`) and its callback. `sandbox-tests/tests/gas.rs` runs every
+/// flow with exactly this much and checks the margin. Below it the agent gets a clear error.
 pub const MIN_PREPAID_GAS: Gas = Gas::from_tgas(50);
 
 /// 1 to 64 characters from `[A-Za-z0-9._-]`. The id is written into proposal descriptions,

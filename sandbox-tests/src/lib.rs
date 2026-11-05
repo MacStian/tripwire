@@ -43,6 +43,8 @@ pub const GUARD_ROLE: &str = "GuardRequestor";
 pub const DAO_USDC: u128 = 10_000 * USDC;
 /// Gas allowance of the agent's function call key.
 pub const AGENT_KEY_ALLOWANCE: NearToken = NearToken::from_millinear(250);
+/// Gas the agent attaches to `request_payment` in the scenario tests.
+pub const AGENT_GAS: NearGas = NearGas::from_tgas(100);
 
 const STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(10);
 const NO_DEPOSIT: NearToken = NearToken::from_yoctonear(0);
@@ -167,6 +169,58 @@ pub fn check(outcome: &ExecutionFinalResult, what: &str) -> Result<()> {
         bail!("{what} failed: {failures:?}");
     }
     Ok(())
+}
+
+/// The `tripwire` events of all receipts, in execution order, as the NEP-297 JSON objects.
+pub fn events(outcome: &ExecutionFinalResult) -> Vec<Value> {
+    outcome
+        .logs()
+        .into_iter()
+        .filter_map(|log| log.strip_prefix("EVENT_JSON:"))
+        .filter_map(|json| serde_json::from_str::<Value>(json).ok())
+        .filter(|event| event["standard"] == "tripwire")
+        .collect()
+}
+
+/// The names of the `tripwire` events, in order.
+pub fn event_names(outcome: &ExecutionFinalResult) -> Vec<String> {
+    events(outcome).iter().map(|event| event["event"].as_str().unwrap_or("").to_string()).collect()
+}
+
+/// One receipt of a transaction: where it ran, the gas it burnt and its own outcome.
+#[derive(Clone, Debug)]
+pub struct ReceiptGas {
+    pub executor: AccountId,
+    pub gas: NearGas,
+    pub failed: bool,
+    /// Names of the `tripwire` events it emitted.
+    pub events: Vec<String>,
+}
+
+/// Every receipt of the transaction, in execution order.
+pub fn receipts(outcome: &ExecutionFinalResult) -> Vec<ReceiptGas> {
+    outcome
+        .receipt_outcomes()
+        .iter()
+        .map(|receipt| ReceiptGas {
+            executor: receipt.executor_id.clone(),
+            gas: receipt.gas_burnt,
+            failed: receipt.is_failure(),
+            events: receipt
+                .logs
+                .iter()
+                .filter_map(|log| log.strip_prefix("EVENT_JSON:"))
+                .filter_map(|json| serde_json::from_str::<Value>(json).ok())
+                .filter(|event| event["standard"] == "tripwire")
+                .map(|event| event["event"].as_str().unwrap_or("").to_string())
+                .collect(),
+        })
+        .collect()
+}
+
+/// The return value of the whole transaction, for `request_payment` the `PaymentOutcome`.
+pub fn returned(outcome: &ExecutionFinalResult) -> Result<Value> {
+    Ok(outcome.clone().json::<Value>()?)
 }
 
 pub struct Harness {
@@ -432,15 +486,49 @@ impl Harness {
         .await
     }
 
-    /// Proposes a single FunctionCall from the DAO, approves it and checks that it ran.
-    pub async fn dao_function_call(
+    /// The agent asks the guard to pay, signing with its function call key and `gas`.
+    pub async fn request_payment_with_gas(
+        &self,
+        request_id: &str,
+        recipient: &AccountId,
+        token_id: Option<&AccountId>,
+        amount: u128,
+        memo: Option<&str>,
+        gas: NearGas,
+    ) -> Result<ExecutionFinalResult> {
+        let args = json!({
+            "request_id": request_id,
+            "recipient": recipient,
+            "token_id": token_id,
+            "amount": amount.to_string(),
+            "memo": memo,
+        });
+        self.agent_call(&self.guard, "request_payment", args, NO_DEPOSIT, gas).await
+    }
+
+    /// [`Harness::request_payment_with_gas`] with [`AGENT_GAS`].
+    pub async fn request_payment(
+        &self,
+        request_id: &str,
+        recipient: &AccountId,
+        token_id: Option<&AccountId>,
+        amount: u128,
+        memo: Option<&str>,
+    ) -> Result<ExecutionFinalResult> {
+        self.request_payment_with_gas(request_id, recipient, token_id, amount, memo, AGENT_GAS)
+            .await
+    }
+
+    /// Proposes a single FunctionCall from the DAO and approves it. Returns the proposal id and
+    /// the outcome of the vote that executed it, failed or not.
+    pub async fn dao_function_call_outcome(
         &self,
         receiver: &AccountId,
         method: &str,
         args: &Value,
         deposit_yocto: u128,
         gas: NearGas,
-    ) -> Result<u64> {
+    ) -> Result<(u64, ExecutionFinalResult)> {
         let encoded = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(args)?);
         let kind = json!({ "FunctionCall": {
             "receiver_id": receiver,
@@ -452,7 +540,22 @@ impl Harness {
             }],
         } });
         let id = self.propose(&format!("Call {method} on {receiver}"), kind).await?;
-        check(&self.approve(id).await?, &format!("approving proposal {id}"))?;
+        Ok((id, self.approve(id).await?))
+    }
+
+    /// Like [`Harness::dao_function_call_outcome`], but fails unless the call ran and the
+    /// proposal ended as `Approved`.
+    pub async fn dao_function_call(
+        &self,
+        receiver: &AccountId,
+        method: &str,
+        args: &Value,
+        deposit_yocto: u128,
+        gas: NearGas,
+    ) -> Result<u64> {
+        let (id, outcome) =
+            self.dao_function_call_outcome(receiver, method, args, deposit_yocto, gas).await?;
+        check(&outcome, &format!("approving proposal {id}"))?;
         let status = self.proposal(id).await?["status"].clone();
         ensure!(status == "Approved", "proposal {id} ended as {status}");
         Ok(id)
@@ -465,6 +568,11 @@ impl Harness {
 
     pub async fn guard_status(&self) -> Result<Value> {
         self.view(&self.guard, "get_status", json!({})).await
+    }
+
+    /// `get_token_status` of the guard, `None` for native NEAR.
+    pub async fn token_status(&self, token_id: Option<&AccountId>) -> Result<Value> {
+        self.view(&self.guard, "get_token_status", json!({ "token_id": token_id })).await
     }
 
     /// USDC balance in base units.

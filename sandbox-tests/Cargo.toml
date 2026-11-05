@@ -10,8 +10,10 @@ description = "End-to-end tests of the guard against a real Sputnik DAO v2 in a 
 anyhow = "1"
 base64 = "0.22"
 cargo-near-build = "0.11"
+guard = { path = "../contracts/guard" }
 near-api = { version = "0.8", default-features = false }
 near-sandbox = "0.4"
+near-sdk = { workspace = true, features = ["non-contract-usage"] }
 serde = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
