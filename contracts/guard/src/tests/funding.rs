@@ -1,7 +1,5 @@
 use super::*;
 
-const NEAR: u128 = 1_000_000_000_000_000_000_000_000;
-
 /// A guard with 3 NEAR in `near_budget` and 500 USDC in its token budget.
 /// The mocked account balance stays at 10 NEAR, and `min_near_reserve` is 2 NEAR.
 fn funded_guard() -> Guard {

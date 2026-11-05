@@ -29,4 +29,17 @@ pub enum Event {
 
     #[event_version("1.0.0")]
     ReserveWithdrawn { receiver_id: AccountId, amount: U128 },
+
+    #[event_version("1.0.0")]
+    PaymentExecuted {
+        request_id: String,
+        agent: AccountId,
+        recipient: AccountId,
+        token_id: TokenKey,
+        amount: U128,
+        spent_in_period: U128,
+    },
+
+    #[event_version("1.0.0")]
+    PaymentFailed { request_id: String, recipient: AccountId, token_id: TokenKey, amount: U128 },
 }

@@ -5,8 +5,10 @@ use super::*;
 
 mod funding;
 mod governance;
+mod payout;
 mod request;
 
+const NEAR: u128 = 1_000_000_000_000_000_000_000_000;
 const NOW_SEC: u64 = 1_762_300_000;
 const GUARD: &str = "guard.test.near";
 const DAO: &str = "dao.sputnik-dao.test.near";
@@ -57,8 +59,12 @@ fn call_with_balance(predecessor: &str, balance: NearToken) {
 
 /// The next call is a callback of one promise that ended with `result`.
 fn callback_with(result: PromiseResult) {
+    callback_at(result, NOW_SEC);
+}
+
+fn callback_at(result: PromiseResult, now_sec: u64) {
     testing_env!(
-        context(GUARD).build(),
+        context(GUARD).block_timestamp(now_sec * 1_000_000_000).build(),
         near_sdk::test_vm_config(),
         near_sdk::RuntimeFeesConfig::test(),
         Default::default(),

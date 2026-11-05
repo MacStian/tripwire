@@ -6,8 +6,10 @@
 //! Specification: `docs/contract-spec.md` in the planning repo.
 
 pub mod events;
+mod external;
 mod funding;
 mod governance;
+mod payout;
 mod policy;
 mod request;
 
@@ -22,6 +24,7 @@ use near_sdk::{env, near, require, AccountId, BorshStorageKey, Gas, PanicOnDefau
 // Starting points. The sandbox gas tests (E2-S2) measure the worst case and set the final values.
 pub(crate) const GAS_FT_TRANSFER: Gas = Gas::from_tgas(15);
 pub(crate) const GAS_ON_WITHDRAW: Gas = Gas::from_tgas(10);
+pub(crate) const GAS_ON_PAYOUT: Gas = Gas::from_tgas(10);
 
 #[near(serializers = [borsh])]
 #[derive(BorshStorageKey)]

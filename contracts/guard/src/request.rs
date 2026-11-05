@@ -1,9 +1,9 @@
-//! Checks for `request_payment`: hard preconditions (Step A) and the policy decision (Step B).
+//! `request_payment`: hard preconditions (Step A), the policy decision (Step B) and the outcome.
 
 use near_sdk::json_types::U128;
-use near_sdk::{env, near, require, AccountId, Gas};
+use near_sdk::{env, near, require, AccountId, Gas, Promise};
 
-use crate::{now_sec, Guard, TokenKey};
+use crate::{now_sec, Guard, GuardExt, TokenKey};
 
 pub const MAX_REQUEST_ID_LEN: usize = 64;
 
@@ -46,6 +46,39 @@ impl EscalationReason {
 pub enum Decision {
     Pay,
     Escalate(EscalationReason),
+}
+
+/// What `request_payment` resolves to, so the agent reads the outcome from the transaction
+/// result instead of parsing logs.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaymentOutcome {
+    Paid { request_id: String },
+    PaymentFailed { request_id: String },
+}
+
+#[near]
+impl Guard {
+    /// Agent entry point. Non-payable, because a function call access key cannot attach a
+    /// deposit. Panics on a failed precondition and changes nothing. Pays inside the policy.
+    /// For now a request outside the policy is rejected with its reason.
+    pub fn request_payment(
+        &mut self,
+        request_id: String,
+        recipient: AccountId,
+        token_id: TokenKey,
+        amount: U128,
+        memo: Option<String>,
+    ) -> Promise {
+        let _ = memo;
+        self.assert_request_allowed(&request_id, amount);
+        match self.evaluate(&recipient, &token_id, amount.0) {
+            Decision::Pay => self.pay(request_id, recipient, token_id, amount),
+            Decision::Escalate(reason) => {
+                env::panic_str(&format!("ERR_OUTSIDE_POLICY: {}", reason.as_str()))
+            }
+        }
+    }
 }
 
 impl Guard {
