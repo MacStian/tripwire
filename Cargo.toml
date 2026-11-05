@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["contracts/guard", "contracts/mock-ft"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+near-sdk = "5.30"
+near-contract-standards = "5.30"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
