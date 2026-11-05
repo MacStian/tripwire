@@ -45,7 +45,7 @@ hash to this commit and that the sha256 of the bytes, in base58, equals the hash
 | `council.test.near` | Only council member of the DAO, also the guard's guardian |
 | `dao.test.near` | Sputnik DAO. Role `GuardRequestor` gives the guard `transfer:AddProposal` only |
 | `usdc.test.near` | Mock NEP-141 token, 6 decimals. DAO, guard and vendor hold storage |
-| `guard.test.near` | The guard, funded through approved DAO `FunctionCall` proposals |
+| `guard.test.near` | The guard, funded through approved DAO `FunctionCall` proposals. No access keys after `new` |
 | `agent.test.near` | Signs with a function call key for `request_payment` on the guard only |
 | `vendor.test.near` | The one allowlisted recipient |
 

@@ -193,7 +193,8 @@ impl Harness {
     /// 2. the Sputnik DAO with the council and the `GuardRequestor` role,
     /// 3. the USDC mock with storage for the DAO, guard and vendor, and USDC minted to the DAO,
     /// 4. the guard with the default policy, funded through approved DAO proposals,
-    /// 5. a function call key for the agent, limited to `request_payment` on the guard.
+    /// 5. the guard account locked: every access key deleted after `new`,
+    /// 6. a function call key for the agent, limited to `request_payment` on the guard.
     pub async fn start(opts: Options) -> Result<Self> {
         let sandbox = Sandbox::start_sandbox().await.context("starting the sandbox")?;
         let network = NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
@@ -231,6 +232,7 @@ impl Harness {
         harness.deploy_dao().await?;
         harness.deploy_usdc().await?;
         harness.deploy_guard(opts.policy).await?;
+        harness.lock_guard().await?;
         harness.fund_guard(opts.near_budget, opts.usdc_budget).await?;
         harness.add_agent_key().await?;
         Ok(harness)
@@ -260,6 +262,18 @@ impl Harness {
         edit_policy(&mut policy);
         let args = json!({ "dao_id": self.dao, "policy": policy });
         self.deploy(&self.guard, guard_wasm(), args).await
+    }
+
+    /// Deletes every access key of the guard. From here on only its own code can move its
+    /// funds, and nobody can redeploy it.
+    async fn lock_guard(&self) -> Result<()> {
+        let keys = self.access_keys(&self.guard).await?;
+        let result = Account(self.guard.clone())
+            .delete_keys(keys)
+            .with_signer(self.signer.clone())
+            .send_to(&self.network)
+            .await?;
+        check(&full(result)?, "deleting the guard keys")
     }
 
     async fn fund_guard(&self, near: NearToken, usdc: u128) -> Result<()> {
@@ -442,6 +456,11 @@ impl Harness {
         let status = self.proposal(id).await?["status"].clone();
         ensure!(status == "Approved", "proposal {id} ended as {status}");
         Ok(id)
+    }
+
+    pub async fn access_keys(&self, id: &AccountId) -> Result<Vec<PublicKey>> {
+        let keys = Account(id.clone()).list_keys().fetch_from(&self.network).await?;
+        Ok(keys.data.into_iter().map(|(public_key, _)| public_key).collect())
     }
 
     pub async fn guard_status(&self) -> Result<Value> {

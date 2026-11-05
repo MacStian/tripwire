@@ -48,6 +48,9 @@ async fn default_setup() -> anyhow::Result<()> {
     assert_eq!(status["policy"]["agents"], json!([h.agent]));
     assert_eq!(status["policy"]["proposal_bond"], bond);
 
+    // The guard account has no keys, so nobody can sign for it or redeploy it.
+    assert!(h.access_keys(&h.guard).await?.is_empty());
+
     // The agent: a function call key that only reaches request_payment on the guard.
     let key = Account(h.agent.clone()).access_key(h.agent_key).fetch_from(&h.network).await?;
     let AccessKeyPermission::FunctionCall(permission) = key.data.permission else {
