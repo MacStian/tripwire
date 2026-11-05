@@ -5,7 +5,10 @@ use std::collections::BTreeSet;
 use near_sdk::{env, near, require};
 
 use crate::events::Event;
-use crate::{current_period_start, now_sec, validate_policy, Guard, GuardExt, Policy, TokenKey};
+use crate::{
+    borsh_len, current_period_start, now_sec, storage_cost, validate_policy, Guard, GuardExt,
+    Policy, TokenKey,
+};
 
 #[near]
 impl Guard {
@@ -16,7 +19,9 @@ impl Guard {
         validate_policy(&policy, now_sec(), &env::current_account_id());
         let old = std::mem::replace(&mut self.policy, policy);
         self.rebase_usage(&old);
-        self.assert_reserve(0);
+        // The larger policy is written after this method returns, so its growth counts here.
+        let growth = borsh_len(&self.policy).saturating_sub(borsh_len(&old));
+        self.assert_reserve(storage_cost(growth));
         Event::PolicyUpdated { by: env::predecessor_account_id() }.emit();
     }
 

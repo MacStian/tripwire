@@ -1,10 +1,13 @@
 //! Funding the budgets and DAO withdrawals.
 
 use near_sdk::json_types::U128;
-use near_sdk::{env, ext_contract, near, require, AccountId, NearToken, Promise};
+use near_sdk::{env, ext_contract, near, require, AccountId, NearToken, Promise, PromiseOrValue};
 
 use crate::events::Event;
-use crate::{promise_succeeded, Guard, GuardExt, TokenKey, GAS_FT_TRANSFER, GAS_ON_WITHDRAW};
+use crate::{
+    promise_succeeded, Guard, GuardExt, TokenKey, GAS_FAIL_WITHDRAWAL, GAS_FT_TRANSFER,
+    GAS_ON_WITHDRAW,
+};
 
 // Only the generated ext_ft module is used, not the trait itself.
 #[ext_contract(ext_ft)]
@@ -60,11 +63,12 @@ impl Guard {
         U128(0)
     }
 
-    /// DAO only. Sends NEAR from `near_budget` to `receiver_id` (default: the DAO).
+    /// DAO only. Sends NEAR from `near_budget` to `receiver_id` (default: the DAO). Works also
+    /// while I1 is short, because it lowers the budget by what it sends.
     pub fn withdraw_near(&mut self, amount: U128, receiver_id: Option<AccountId>) -> Promise {
         self.assert_dao();
         self.debit(&None, amount.0);
-        self.assert_reserve(amount.0);
+        self.assert_can_send(amount.0);
         let receiver_id = receiver_id.unwrap_or_else(|| self.dao_id.clone());
         Promise::new(receiver_id.clone())
             .transfer(NearToken::from_yoctonear(amount.0))
@@ -83,7 +87,7 @@ impl Guard {
         self.assert_dao();
         let key = Some(token_id.clone());
         self.debit(&key, amount.0);
-        self.assert_reserve(1);
+        self.assert_can_send(1);
         let receiver_id = receiver_id.unwrap_or_else(|| self.dao_id.clone());
         ext_ft::ext(token_id)
             .with_attached_deposit(NearToken::from_yoctonear(1))
@@ -108,7 +112,10 @@ impl Guard {
             .then(Self::withdraw_callback(Withdrawal::Unallocated, amount, receiver_id))
     }
 
-    /// Never panics. On success emits the withdrawal event. On failure restores the budget.
+    /// Never panics. On success emits the withdrawal event and returns `true`. On failure
+    /// restores the budget, emits `withdrawal_failed` and ends the chain in a failed receipt
+    /// (`fail_withdrawal`), so the DAO proposal that asked for the withdrawal resolves as
+    /// failed instead of executed. The restore is kept, because it happens in this receipt.
     /// A failed NEAR transfer comes back to the guard in its own refund receipt.
     #[private]
     pub fn on_withdraw_complete(
@@ -116,24 +123,41 @@ impl Guard {
         withdrawal: Withdrawal,
         amount: U128,
         receiver_id: AccountId,
-    ) -> bool {
+    ) -> PromiseOrValue<bool> {
         let Some(succeeded) = promise_succeeded() else {
-            return false;
+            return PromiseOrValue::Value(false);
         };
-        match (withdrawal, succeeded) {
-            (Withdrawal::Budget(token_id), true) => {
-                let remaining_budget = U128(self.budget_of(&token_id));
-                Event::BudgetWithdrawn { receiver_id, token_id, amount, remaining_budget }.emit();
+        if succeeded {
+            match withdrawal {
+                Withdrawal::Budget(token_id) => {
+                    let remaining_budget = U128(self.budget_of(&token_id));
+                    Event::BudgetWithdrawn { receiver_id, token_id, amount, remaining_budget }
+                        .emit();
+                }
+                Withdrawal::Unallocated => Event::ReserveWithdrawn { receiver_id, amount }.emit(),
             }
-            (Withdrawal::Budget(token_id), false) => {
-                self.credit(&token_id, amount.0);
-            }
-            (Withdrawal::Unallocated, true) => {
-                Event::ReserveWithdrawn { receiver_id, amount }.emit();
-            }
-            (Withdrawal::Unallocated, false) => {}
+            return PromiseOrValue::Value(true);
         }
-        succeeded
+        let (token_id, unallocated) = match withdrawal {
+            Withdrawal::Budget(token_id) => {
+                self.credit(&token_id, amount.0);
+                (token_id, false)
+            }
+            Withdrawal::Unallocated => (None, true),
+        };
+        Event::WithdrawalFailed { receiver_id, token_id, amount, unallocated }.emit();
+        PromiseOrValue::Promise(
+            Self::ext(env::current_account_id())
+                .with_static_gas(GAS_FAIL_WITHDRAWAL)
+                .fail_withdrawal(),
+        )
+    }
+
+    /// Always panics. Only `on_withdraw_complete` calls it, so that a failed withdrawal ends
+    /// its promise chain as a failure.
+    #[private]
+    pub fn fail_withdrawal(&self) {
+        env::panic_str("ERR_WITHDRAWAL_FAILED")
     }
 }
 

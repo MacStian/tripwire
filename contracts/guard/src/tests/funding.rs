@@ -1,6 +1,6 @@
-use super::*;
+use near_sdk::PromiseOrValue;
 
-const NEAR: u128 = 1_000_000_000_000_000_000_000_000;
+use super::*;
 
 /// A guard with 3 NEAR in `near_budget` and 500 USDC in its token budget.
 /// The mocked account balance stays at 10 NEAR, and `min_near_reserve` is 2 NEAR.
@@ -15,6 +15,42 @@ fn funded_guard() -> Guard {
 
 fn usdc_budget(guard: &Guard) -> U128 {
     guard.get_token_status(Some(usdc())).unwrap().budget
+}
+
+/// The callback's plain value, or `None` when it returned a promise.
+fn returned(outcome: PromiseOrValue<bool>) -> Option<bool> {
+    match outcome {
+        PromiseOrValue::Value(value) => Some(value),
+        PromiseOrValue::Promise(_) => None,
+    }
+}
+
+/// A failed withdrawal ends its chain in `fail_withdrawal` on the guard.
+fn assert_chain_fails(outcome: PromiseOrValue<bool>) {
+    assert_eq!(returned(outcome), None);
+    let receipts = get_created_receipts();
+    let [receipt] = receipts.as_slice() else {
+        panic!("expected one receipt, got {receipts:?}");
+    };
+    assert_eq!(receipt.receiver_id, acc(GUARD));
+    let [MockAction::FunctionCallWeight { method_name, attached_deposit, prepaid_gas, .. }] =
+        receipt.actions.as_slice()
+    else {
+        panic!("expected one function call, got {:?}", receipt.actions);
+    };
+    assert_eq!(method_name, b"fail_withdrawal");
+    assert_eq!(*attached_deposit, NearToken::from_yoctonear(0));
+    assert_eq!(*prepaid_gas, GAS_FAIL_WITHDRAWAL);
+}
+
+/// JSON args of the callback a withdrawal chains after its transfer.
+fn withdraw_callback(receipt: &Receipt) -> serde_json::Value {
+    assert_eq!(receipt.receiver_id, acc(GUARD));
+    let (method, args, deposit, gas) = function_call(receipt);
+    assert_eq!(method, "on_withdraw_complete");
+    assert_eq!(deposit, NearToken::from_yoctonear(0));
+    assert_eq!(gas, GAS_ON_WITHDRAW);
+    args
 }
 
 #[test]
@@ -108,12 +144,44 @@ fn withdraw_near_rejects_zero() {
 }
 
 #[test]
-#[should_panic(expected = "ERR_INSUFFICIENT_NEAR_RESERVE")]
-fn withdraw_near_keeps_the_reserve_invariant() {
-    // 4 NEAR on the account cannot cover 2 NEAR reserve plus 3 NEAR budget.
+fn withdraw_near_works_while_the_reserve_is_short() {
+    // 4 NEAR on the account cannot cover 2 NEAR reserve plus 3 NEAR budget. The DAO can
+    // still take budget NEAR out, and the shortfall stays the same.
     let mut guard = funded_guard();
     call_with_balance(DAO, NearToken::from_near(4));
     let _ = guard.withdraw_near(U128(NEAR), None);
+    assert_eq!(guard.get_status().near_budget, U128(2 * NEAR));
+}
+
+#[test]
+#[should_panic(expected = "ERR_INSUFFICIENT_NEAR_RESERVE")]
+fn withdraw_near_needs_the_near_it_sends() {
+    let mut guard = funded_guard();
+    call_with_balance(DAO, NearToken::from_millinear(500));
+    let _ = guard.withdraw_near(U128(NEAR), None);
+}
+
+#[test]
+fn withdraw_near_sends_a_transfer_and_chains_the_callback() {
+    let mut guard = funded_guard();
+    call_as(DAO);
+    let _ = guard.withdraw_near(U128(NEAR), None);
+
+    let receipts = get_created_receipts();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0].receiver_id, acc(DAO));
+    let [MockAction::Transfer { deposit, .. }] = receipts[0].actions.as_slice() else {
+        panic!("expected one transfer, got {:?}", receipts[0].actions);
+    };
+    assert_eq!(*deposit, NearToken::from_yoctonear(NEAR));
+    assert_eq!(
+        withdraw_callback(&receipts[1]),
+        serde_json::json!({
+            "withdrawal": { "Budget": null },
+            "amount": NEAR.to_string(),
+            "receiver_id": DAO,
+        })
+    );
 }
 
 #[test]
@@ -124,7 +192,8 @@ fn withdraw_near_debits_and_the_callback_reports_success() {
     assert_eq!(guard.get_status().near_budget, U128(2 * NEAR));
 
     callback_with(PromiseResult::Successful(vec![]));
-    assert!(guard.on_withdraw_complete(Withdrawal::Budget(None), U128(NEAR), acc(DAO)));
+    let outcome = guard.on_withdraw_complete(Withdrawal::Budget(None), U128(NEAR), acc(DAO));
+    assert_eq!(returned(outcome), Some(true));
     assert_eq!(guard.get_status().near_budget, U128(2 * NEAR));
     let event = only_event();
     assert_eq!(event["event"], "budget_withdrawn");
@@ -140,28 +209,81 @@ fn withdraw_near_debits_and_the_callback_reports_success() {
 }
 
 #[test]
-fn failed_near_withdrawal_restores_the_budget() {
+fn failed_near_withdrawal_restores_the_budget_and_fails_the_chain() {
     let mut guard = funded_guard();
     call_as(DAO);
     let _ = guard.withdraw_near(U128(NEAR), Some(acc("missing.test.near")));
 
     callback_with(PromiseResult::Failed);
-    assert!(!guard.on_withdraw_complete(
-        Withdrawal::Budget(None),
-        U128(NEAR),
-        acc("missing.test.near")
-    ));
+    let missing = acc("missing.test.near");
+    assert_chain_fails(guard.on_withdraw_complete(Withdrawal::Budget(None), U128(NEAR), missing));
     assert_eq!(guard.get_status().near_budget, U128(3 * NEAR));
-    assert!(events().is_empty());
+    let event = only_event();
+    assert_eq!(event["event"], "withdrawal_failed");
+    assert_eq!(
+        event["data"],
+        serde_json::json!({
+            "receiver_id": "missing.test.near",
+            "token_id": null,
+            "amount": NEAR.to_string(),
+            "unallocated": false,
+        })
+    );
+}
+
+#[test]
+#[should_panic(expected = "ERR_WITHDRAWAL_FAILED")]
+fn fail_withdrawal_always_panics() {
+    let guard = funded_guard();
+    call_as(GUARD);
+    guard.fail_withdrawal();
 }
 
 #[test]
 fn callback_without_a_promise_result_changes_nothing() {
     let mut guard = funded_guard();
     call_as(GUARD);
-    assert!(!guard.on_withdraw_complete(Withdrawal::Budget(None), U128(NEAR), acc(DAO)));
+    let outcome = guard.on_withdraw_complete(Withdrawal::Budget(None), U128(NEAR), acc(DAO));
+    assert_eq!(returned(outcome), Some(false));
     assert_eq!(guard.get_status().near_budget, U128(3 * NEAR));
     assert!(events().is_empty());
+    assert!(get_created_receipts().is_empty());
+}
+
+#[test]
+fn withdraw_ft_sends_ft_transfer_and_chains_the_callback() {
+    let mut guard = funded_guard();
+    call_as(DAO);
+    let _ = guard.withdraw_ft(usdc(), U128(200_000_000), None);
+
+    let receipts = get_created_receipts();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0].receiver_id, usdc());
+    let (method, args, deposit, gas) = function_call(&receipts[0]);
+    assert_eq!(method, "ft_transfer");
+    assert_eq!(
+        args,
+        serde_json::json!({ "receiver_id": DAO, "amount": "200000000", "memo": null })
+    );
+    assert_eq!(deposit, NearToken::from_yoctonear(1));
+    assert_eq!(gas, GAS_FT_TRANSFER);
+    assert_eq!(
+        withdraw_callback(&receipts[1]),
+        serde_json::json!({
+            "withdrawal": { "Budget": USDC },
+            "amount": "200000000",
+            "receiver_id": DAO,
+        })
+    );
+}
+
+#[test]
+fn withdraw_ft_works_while_the_reserve_is_short() {
+    // 3 NEAR on the account is under the 2 NEAR reserve plus 3 NEAR budget.
+    let mut guard = funded_guard();
+    call_with_balance(DAO, NearToken::from_near(3));
+    let _ = guard.withdraw_ft(usdc(), U128(200_000_000), None);
+    assert_eq!(usdc_budget(&guard), U128(300_000_000));
 }
 
 #[test]
@@ -172,12 +294,13 @@ fn withdraw_ft_debits_and_a_failed_transfer_restores_the_budget() {
     assert_eq!(usdc_budget(&guard), U128(300_000_000));
 
     callback_with(PromiseResult::Failed);
-    assert!(!guard.on_withdraw_complete(
-        Withdrawal::Budget(Some(usdc())),
-        U128(200_000_000),
-        acc(DAO)
-    ));
+    let budget = Withdrawal::Budget(Some(usdc()));
+    assert_chain_fails(guard.on_withdraw_complete(budget, U128(200_000_000), acc(DAO)));
     assert_eq!(usdc_budget(&guard), U128(500_000_000));
+    let event = only_event();
+    assert_eq!(event["event"], "withdrawal_failed");
+    assert_eq!(event["data"]["token_id"], USDC);
+    assert_eq!(event["data"]["unallocated"], false);
 }
 
 #[test]
@@ -187,11 +310,9 @@ fn successful_ft_withdrawal_emits_the_remaining_budget() {
     let _ = guard.withdraw_ft(usdc(), U128(200_000_000), None);
 
     callback_with(PromiseResult::Successful(vec![]));
-    assert!(guard.on_withdraw_complete(
-        Withdrawal::Budget(Some(usdc())),
-        U128(200_000_000),
-        acc(DAO)
-    ));
+    let budget = Withdrawal::Budget(Some(usdc()));
+    let outcome = guard.on_withdraw_complete(budget, U128(200_000_000), acc(DAO));
+    assert_eq!(returned(outcome), Some(true));
     let event = only_event();
     assert_eq!(event["event"], "budget_withdrawn");
     assert_eq!(event["data"]["token_id"], USDC);
@@ -221,9 +342,20 @@ fn withdraw_unallocated_near_leaves_the_budget_alone() {
     call_as(DAO);
     let _ = guard.withdraw_unallocated_near(U128(4 * NEAR), None);
     assert_eq!(guard.get_status().near_budget, U128(3 * NEAR));
+    let receipts = get_created_receipts();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(
+        withdraw_callback(&receipts[1]),
+        serde_json::json!({
+            "withdrawal": "Unallocated",
+            "amount": (4 * NEAR).to_string(),
+            "receiver_id": DAO,
+        })
+    );
 
     callback_with(PromiseResult::Successful(vec![]));
-    assert!(guard.on_withdraw_complete(Withdrawal::Unallocated, U128(4 * NEAR), acc(DAO)));
+    let outcome = guard.on_withdraw_complete(Withdrawal::Unallocated, U128(4 * NEAR), acc(DAO));
+    assert_eq!(returned(outcome), Some(true));
     let event = only_event();
     assert_eq!(event["event"], "reserve_withdrawn");
     assert_eq!(
@@ -249,13 +381,16 @@ fn withdraw_unallocated_near_rejects_a_non_dao_caller() {
 }
 
 #[test]
-fn failed_unallocated_withdrawal_changes_no_budget() {
+fn failed_unallocated_withdrawal_changes_no_budget_and_fails_the_chain() {
     let mut guard = funded_guard();
     call_as(DAO);
     let _ = guard.withdraw_unallocated_near(U128(NEAR), None);
 
     callback_with(PromiseResult::Failed);
-    assert!(!guard.on_withdraw_complete(Withdrawal::Unallocated, U128(NEAR), acc(DAO)));
+    assert_chain_fails(guard.on_withdraw_complete(Withdrawal::Unallocated, U128(NEAR), acc(DAO)));
     assert_eq!(guard.get_status().near_budget, U128(3 * NEAR));
-    assert!(events().is_empty());
+    let event = only_event();
+    assert_eq!(event["event"], "withdrawal_failed");
+    assert_eq!(event["data"]["token_id"], serde_json::Value::Null);
+    assert_eq!(event["data"]["unallocated"], true);
 }

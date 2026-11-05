@@ -1,4 +1,5 @@
-use near_sdk::test_utils::{get_logs, VMContextBuilder};
+use near_sdk::mock::{MockAction, Receipt};
+use near_sdk::test_utils::{get_created_receipts, get_logs, VMContextBuilder};
 use near_sdk::{serde_json, testing_env, NearToken, PromiseResult};
 
 use super::*;
@@ -6,6 +7,7 @@ use super::*;
 mod funding;
 mod governance;
 
+const NEAR: u128 = 1_000_000_000_000_000_000_000_000;
 const NOW_SEC: u64 = 1_762_300_000;
 const GUARD: &str = "guard.test.near";
 const DAO: &str = "dao.sputnik-dao.test.near";
@@ -72,6 +74,21 @@ fn events() -> Vec<serde_json::Value> {
         .filter_map(|line| line.strip_prefix("EVENT_JSON:"))
         .map(|json| serde_json::from_str(json).unwrap())
         .collect()
+}
+
+/// Method, JSON args, deposit and static gas of a receipt with one function call.
+fn function_call(receipt: &Receipt) -> (String, serde_json::Value, NearToken, Gas) {
+    let [MockAction::FunctionCallWeight { method_name, args, attached_deposit, prepaid_gas, .. }] =
+        receipt.actions.as_slice()
+    else {
+        panic!("expected one function call, got {:?}", receipt.actions);
+    };
+    (
+        String::from_utf8(method_name.clone()).unwrap(),
+        serde_json::from_slice(args).unwrap(),
+        *attached_deposit,
+        *prepaid_gas,
+    )
 }
 
 fn only_event() -> serde_json::Value {
@@ -219,4 +236,36 @@ fn rejects_guard_as_recipient() {
 #[should_panic(expected = "ERR_INVALID_POLICY: guard account")]
 fn rejects_guard_as_agent() {
     guard_with(Policy { agents: vec![acc(GUARD)], ..policy() });
+}
+
+#[test]
+#[should_panic(expected = "ERR_INVALID_POLICY: agent in recipients")]
+fn rejects_an_agent_that_is_also_a_recipient() {
+    let recipients = vec![acc("hosting.test.near"), acc(AGENT)];
+    guard_with(Policy { recipients, ..policy() });
+}
+
+/// `new` with this account balance. 1 000 bytes of storage lock 0.01 NEAR of it.
+fn init_with_balance(yocto: u128) -> Guard {
+    testing_env!(context(GUARD).account_balance(NearToken::from_yoctonear(yocto)).build());
+    Guard::new(acc(DAO), policy())
+}
+
+#[test]
+#[should_panic(expected = "ERR_INSUFFICIENT_NEAR_RESERVE")]
+fn init_needs_the_reserve() {
+    init_with_balance(2 * NEAR);
+}
+
+#[test]
+#[should_panic(expected = "ERR_INSUFFICIENT_NEAR_RESERVE")]
+fn init_counts_the_storage_of_its_own_state() {
+    // 0.002 NEAR above the 2 NEAR reserve is less than the state itself needs.
+    init_with_balance(2 * NEAR + NEAR / 100 + NEAR / 500);
+}
+
+#[test]
+fn init_passes_with_room_for_its_state() {
+    let guard = init_with_balance(2 * NEAR + NEAR / 50);
+    assert_eq!(guard.get_status().near_budget, U128(0));
 }

@@ -19,7 +19,8 @@ use near_sdk::{env, near, require, AccountId, BorshStorageKey, Gas, PanicOnDefau
 
 // Starting points. The sandbox gas tests (E2-S2) measure the worst case and set the final values.
 pub(crate) const GAS_FT_TRANSFER: Gas = Gas::from_tgas(15);
-pub(crate) const GAS_ON_WITHDRAW: Gas = Gas::from_tgas(10);
+pub(crate) const GAS_ON_WITHDRAW: Gas = Gas::from_tgas(15);
+pub(crate) const GAS_FAIL_WITHDRAWAL: Gas = Gas::from_tgas(5);
 
 #[near(serializers = [borsh])]
 #[derive(BorshStorageKey)]
@@ -80,6 +81,19 @@ pub(crate) fn free_near_balance() -> u128 {
     env::account_balance().as_yoctonear().saturating_sub(staked)
 }
 
+/// NEAR that `bytes` of storage lock.
+pub(crate) fn storage_cost(bytes: usize) -> u128 {
+    (bytes as u128).saturating_mul(env::storage_byte_cost().as_yoctonear())
+}
+
+/// Borsh size of a value, for storage that is written only after the method returns.
+pub(crate) fn borsh_len<T: near_sdk::borsh::BorshSerialize>(value: &T) -> usize {
+    near_sdk::borsh::to_vec(value).map(|bytes| bytes.len()).unwrap_or(usize::MAX)
+}
+
+/// Storage of the root state record beyond its value: the `STATE` key and the record overhead.
+const STATE_RECORD_OVERHEAD: usize = 5 + 40;
+
 /// Outcome of the single promise a callback waits for. `None` when the method was not called
 /// as a callback of exactly one promise. Never panics, so callbacks can always finish.
 pub(crate) fn promise_succeeded() -> Option<bool> {
@@ -98,7 +112,7 @@ impl Guard {
         let now = now_sec();
         validate_policy(&policy, now, &env::current_account_id());
         let period_start = current_period_start(now, policy.period_anchor, policy.period_seconds);
-        Self {
+        let guard = Self {
             dao_id,
             policy,
             frozen: false,
@@ -107,7 +121,11 @@ impl Guard {
             token_usage: LookupMap::new(StorageKey::TokenUsage),
             request_usage: RequestUsage { period_start, ..Default::default() },
             processed_requests: LookupSet::new(StorageKey::ProcessedRequests),
-        }
+        };
+        // I1 from the start. The state is written after `new` returns, so its storage is
+        // counted here by hand.
+        guard.assert_reserve(storage_cost(borsh_len(&guard) + STATE_RECORD_OVERHEAD));
+        guard
     }
 
     pub fn get_policy(&self) -> Policy {
@@ -163,8 +181,8 @@ impl Guard {
 
     /// Invariant I1: the NEAR left after `outgoing_near` covers `min_near_reserve` and the
     /// spendable `near_budget`. Call it after the method's own debits and before the promise.
-    /// The contract root state is written after the method returns, so `min_near_reserve`
-    /// must also cover small growth of the policy itself.
+    /// The root state is written after the method returns, so a method that grows it (`new`,
+    /// `update_policy`) adds the cost of that growth to `outgoing_near`.
     pub(crate) fn assert_reserve(&self, outgoing_near: u128) {
         let required = self
             .policy
@@ -173,6 +191,13 @@ impl Guard {
             .saturating_add(self.near_budget)
             .saturating_add(outgoing_near);
         require!(free_near_balance() >= required, "ERR_INSUFFICIENT_NEAR_RESERVE");
+    }
+
+    /// For DAO withdrawals from a budget: the guard only needs the NEAR it sends. Moving funds
+    /// out of a budget never makes an I1 shortfall worse (apart from the 1 yoctoNEAR an
+    /// `ft_transfer` needs), and a guard that is already short must still return its funds.
+    pub(crate) fn assert_can_send(&self, outgoing_near: u128) {
+        require!(free_near_balance() >= outgoing_near, "ERR_INSUFFICIENT_NEAR_RESERVE");
     }
 
     fn current_period_start(&self) -> u64 {
