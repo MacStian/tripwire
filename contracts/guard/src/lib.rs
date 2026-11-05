@@ -5,6 +5,7 @@
 //! humans vote. Only the DAO can change the policy, unfreeze the guard or withdraw funds.
 //! Specification: `docs/contract-spec.md` in the planning repo.
 
+mod escalation;
 pub mod events;
 mod external;
 mod funding;
@@ -13,6 +14,8 @@ mod payout;
 mod policy;
 mod request;
 
+pub use escalation::{clean_memo, proposal_description, MAX_NOTE_LEN};
+pub use external::{ProposalInput, ProposalKind};
 pub use funding::Withdrawal;
 pub use policy::*;
 pub use request::*;
@@ -25,6 +28,8 @@ use near_sdk::{env, near, require, AccountId, BorshStorageKey, Gas, PanicOnDefau
 pub(crate) const GAS_FT_TRANSFER: Gas = Gas::from_tgas(15);
 pub(crate) const GAS_ON_WITHDRAW: Gas = Gas::from_tgas(10);
 pub(crate) const GAS_ON_PAYOUT: Gas = Gas::from_tgas(10);
+pub(crate) const GAS_ADD_PROPOSAL: Gas = Gas::from_tgas(25);
+pub(crate) const GAS_ON_ESCALATION: Gas = Gas::from_tgas(10);
 
 #[near(serializers = [borsh])]
 #[derive(BorshStorageKey)]
@@ -85,14 +90,35 @@ pub(crate) fn free_near_balance() -> u128 {
     env::account_balance().as_yoctonear().saturating_sub(staked)
 }
 
-/// Outcome of the single promise a callback waits for. `None` when the method was not called
-/// as a callback of exactly one promise. Never panics, so callbacks can always finish.
-pub(crate) fn promise_succeeded() -> Option<bool> {
+/// Result of the single promise a callback waits for.
+pub(crate) enum PromiseOutcome {
+    /// The method was not called as a callback of exactly one promise.
+    Missing,
+    Failed,
+    /// The value, or `None` when it is longer than the limit the caller asked for.
+    Succeeded(Option<Vec<u8>>),
+}
+
+/// Reads the promise result with a length limit. Never panics, so callbacks can always finish.
+pub(crate) fn promise_outcome(max_len: usize) -> PromiseOutcome {
     if env::promise_results_count() != 1 {
-        return None;
+        return PromiseOutcome::Missing;
     }
+    match env::promise_result_checked(0, max_len) {
+        Ok(value) => PromiseOutcome::Succeeded(Some(value)),
+        Err(PromiseError::TooLong(_)) => PromiseOutcome::Succeeded(None),
+        Err(_) => PromiseOutcome::Failed,
+    }
+}
+
+/// `None` when the method was not called as a callback of exactly one promise.
+pub(crate) fn promise_succeeded() -> Option<bool> {
     // A length limit of 0 avoids copying the result. A longer result still means success.
-    Some(matches!(env::promise_result_checked(0, 0), Ok(_) | Err(PromiseError::TooLong(_))))
+    match promise_outcome(0) {
+        PromiseOutcome::Missing => None,
+        PromiseOutcome::Failed => Some(false),
+        PromiseOutcome::Succeeded(_) => Some(true),
+    }
 }
 
 #[near]

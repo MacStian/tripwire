@@ -53,15 +53,28 @@ pub enum Decision {
 #[near(serializers = [json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaymentOutcome {
-    Paid { request_id: String },
-    PaymentFailed { request_id: String },
+    Paid {
+        request_id: String,
+    },
+    PaymentFailed {
+        request_id: String,
+    },
+    /// `proposal_id` is `None` only if the DAO's answer could not be read as an id.
+    Escalated {
+        request_id: String,
+        proposal_id: Option<u64>,
+    },
+    EscalationFailed {
+        request_id: String,
+    },
 }
 
 #[near]
 impl Guard {
     /// Agent entry point. Non-payable, because a function call access key cannot attach a
-    /// deposit. Panics on a failed precondition and changes nothing. Pays inside the policy.
-    /// For now a request outside the policy is rejected with its reason.
+    /// deposit. Panics on a failed precondition and changes nothing. Pays inside the policy,
+    /// otherwise files a Transfer proposal for a DAO vote. `memo` is used only as the note
+    /// in that proposal.
     pub fn request_payment(
         &mut self,
         request_id: String,
@@ -70,12 +83,11 @@ impl Guard {
         amount: U128,
         memo: Option<String>,
     ) -> Promise {
-        let _ = memo;
         self.assert_request_allowed(&request_id, amount);
         match self.evaluate(&recipient, &token_id, amount.0) {
             Decision::Pay => self.pay(request_id, recipient, token_id, amount),
             Decision::Escalate(reason) => {
-                env::panic_str(&format!("ERR_OUTSIDE_POLICY: {}", reason.as_str()))
+                self.escalate(request_id, recipient, token_id, amount, reason, memo)
             }
         }
     }

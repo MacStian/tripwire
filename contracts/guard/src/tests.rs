@@ -1,8 +1,10 @@
-use near_sdk::test_utils::{get_logs, VMContextBuilder};
+use near_sdk::mock::{MockAction, Receipt};
+use near_sdk::test_utils::{get_created_receipts, get_logs, VMContextBuilder};
 use near_sdk::{serde_json, testing_env, NearToken, PromiseResult};
 
 use super::*;
 
+mod escalation;
 mod funding;
 mod governance;
 mod payout;
@@ -79,6 +81,21 @@ fn events() -> Vec<serde_json::Value> {
         .filter_map(|line| line.strip_prefix("EVENT_JSON:"))
         .map(|json| serde_json::from_str(json).unwrap())
         .collect()
+}
+
+/// Method, JSON args, deposit and static gas of a receipt with one function call.
+fn function_call(receipt: &Receipt) -> (String, serde_json::Value, NearToken, Gas) {
+    let [MockAction::FunctionCallWeight { method_name, args, attached_deposit, prepaid_gas, .. }] =
+        receipt.actions.as_slice()
+    else {
+        panic!("expected one function call, got {:?}", receipt.actions);
+    };
+    (
+        String::from_utf8(method_name.clone()).unwrap(),
+        serde_json::from_slice(args).unwrap(),
+        *attached_deposit,
+        *prepaid_gas,
+    )
 }
 
 fn only_event() -> serde_json::Value {

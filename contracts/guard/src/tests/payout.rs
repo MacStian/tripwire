@@ -1,7 +1,5 @@
 //! The in-policy payout and its callback.
 
-use near_sdk::mock::{MockAction, Receipt};
-use near_sdk::test_utils::get_created_receipts;
 use near_sdk::Gas;
 
 use super::*;
@@ -62,21 +60,6 @@ fn usdc_status(guard: &Guard) -> TokenStatus {
 
 fn payments(guard: &Guard) -> u32 {
     guard.get_status().request_usage.payments_in_period
-}
-
-/// Method, JSON args, deposit and static gas of a receipt with one function call.
-fn function_call(receipt: &Receipt) -> (String, serde_json::Value, NearToken, Gas) {
-    let [MockAction::FunctionCallWeight { method_name, args, attached_deposit, prepaid_gas, .. }] =
-        receipt.actions.as_slice()
-    else {
-        panic!("expected one function call, got {:?}", receipt.actions);
-    };
-    (
-        String::from_utf8(method_name.clone()).unwrap(),
-        serde_json::from_slice(args).unwrap(),
-        *attached_deposit,
-        *prepaid_gas,
-    )
 }
 
 #[test]
@@ -288,17 +271,4 @@ fn a_near_payout_never_takes_the_reserve() {
     let mut guard = funded_guard();
     call_with_balance(AGENT, NearToken::from_millinear(4_900));
     request(&mut guard, "inv-101", None, NEAR);
-}
-
-#[test]
-#[should_panic(expected = "ERR_OUTSIDE_POLICY: RECIPIENT_NOT_ALLOWLISTED")]
-fn rejects_a_request_outside_the_policy() {
-    let mut guard = funded_guard();
-    let _ = guard.request_payment(
-        "inv-101".to_string(),
-        acc("attacker.test.near"),
-        Some(usdc()),
-        U128(1),
-        None,
-    );
 }

@@ -3,7 +3,7 @@
 use near_sdk::json_types::U128;
 use near_sdk::{near, AccountId};
 
-use crate::TokenKey;
+use crate::{EscalationReason, TokenKey};
 
 #[near(event_json(standard = "tripwire"))]
 pub enum Event {
@@ -42,4 +42,24 @@ pub enum Event {
 
     #[event_version("1.0.0")]
     PaymentFailed { request_id: String, recipient: AccountId, token_id: TokenKey, amount: U128 },
+
+    #[event_version("1.0.0")]
+    PaymentEscalated {
+        request_id: String,
+        agent: AccountId,
+        recipient: AccountId,
+        token_id: TokenKey,
+        amount: U128,
+        reason: EscalationReason,
+        proposal_id: Option<u64>,
+    },
+
+    #[event_version("1.0.0")]
+    EscalationFailed {
+        request_id: String,
+        recipient: AccountId,
+        token_id: TokenKey,
+        amount: U128,
+        reason: EscalationReason,
+    },
 }
