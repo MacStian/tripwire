@@ -5,13 +5,21 @@
 //! humans vote. Only the DAO can change the policy, unfreeze the guard or withdraw funds.
 //! Specification: `docs/contract-spec.md` in the planning repo.
 
+pub mod events;
+mod funding;
+mod governance;
 mod policy;
 
+pub use funding::Withdrawal;
 pub use policy::*;
 
 use near_sdk::json_types::U128;
 use near_sdk::store::{LookupMap, LookupSet};
-use near_sdk::{env, near, AccountId, BorshStorageKey, PanicOnDefault};
+use near_sdk::{env, near, require, AccountId, BorshStorageKey, Gas, PanicOnDefault, PromiseError};
+
+// Starting points. The sandbox gas tests (E2-S2) measure the worst case and set the final values.
+pub(crate) const GAS_FT_TRANSFER: Gas = Gas::from_tgas(15);
+pub(crate) const GAS_ON_WITHDRAW: Gas = Gas::from_tgas(10);
 
 #[near(serializers = [borsh])]
 #[derive(BorshStorageKey)]
@@ -70,6 +78,16 @@ pub(crate) fn now_sec() -> u64 {
 pub(crate) fn free_near_balance() -> u128 {
     let staked = u128::from(env::storage_usage()) * env::storage_byte_cost().as_yoctonear();
     env::account_balance().as_yoctonear().saturating_sub(staked)
+}
+
+/// Outcome of the single promise a callback waits for. `None` when the method was not called
+/// as a callback of exactly one promise. Never panics, so callbacks can always finish.
+pub(crate) fn promise_succeeded() -> Option<bool> {
+    if env::promise_results_count() != 1 {
+        return None;
+    }
+    // A length limit of 0 avoids copying the result. A longer result still means success.
+    Some(matches!(env::promise_result_checked(0, 0), Ok(_) | Err(PromiseError::TooLong(_))))
 }
 
 #[near]
@@ -139,6 +157,24 @@ impl Guard {
 }
 
 impl Guard {
+    pub(crate) fn assert_dao(&self) {
+        require!(env::predecessor_account_id() == self.dao_id, "ERR_NOT_DAO");
+    }
+
+    /// Invariant I1: the NEAR left after `outgoing_near` covers `min_near_reserve` and the
+    /// spendable `near_budget`. Call it after the method's own debits and before the promise.
+    /// The contract root state is written after the method returns, so `min_near_reserve`
+    /// must also cover small growth of the policy itself.
+    pub(crate) fn assert_reserve(&self, outgoing_near: u128) {
+        let required = self
+            .policy
+            .min_near_reserve
+            .as_yoctonear()
+            .saturating_add(self.near_budget)
+            .saturating_add(outgoing_near);
+        require!(free_near_balance() >= required, "ERR_INSUFFICIENT_NEAR_RESERVE");
+    }
+
     fn current_period_start(&self) -> u64 {
         current_period_start(now_sec(), self.policy.period_anchor, self.policy.period_seconds)
     }

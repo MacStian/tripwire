@@ -133,6 +133,12 @@ impl PeriodUsage {
             Self { period_start, spent_in_period: U128(0) }
         }
     }
+
+    /// Moves the usage of the current old-grid period to the new grid and keeps the amount.
+    /// Usage from an old period that is already over is dropped.
+    pub fn rebased(&self, old_start: u64, new_start: u64) -> Self {
+        Self { period_start: new_start, ..self.rolled(old_start) }
+    }
 }
 
 /// Payouts and escalations in the current period.
@@ -151,6 +157,11 @@ impl RequestUsage {
         } else {
             Self { period_start, ..Default::default() }
         }
+    }
+
+    /// Same rule as `PeriodUsage::rebased`.
+    pub fn rebased(&self, old_start: u64, new_start: u64) -> Self {
+        Self { period_start: new_start, ..self.rolled(old_start) }
     }
 }
 
@@ -177,6 +188,30 @@ mod tests {
         assert_eq!(usage.rolled(100).spent_in_period, U128(7));
         assert_eq!(usage.rolled(110).spent_in_period, U128(0));
         assert_eq!(usage.rolled(110).period_start, 110);
+    }
+
+    #[test]
+    fn rebase_keeps_current_usage_and_drops_a_finished_period() {
+        let usage = PeriodUsage { period_start: 100, spent_in_period: U128(7) };
+        assert_eq!(
+            usage.rebased(100, 130),
+            PeriodUsage { period_start: 130, spent_in_period: U128(7) }
+        );
+        assert_eq!(
+            usage.rebased(110, 130),
+            PeriodUsage { period_start: 130, spent_in_period: U128(0) }
+        );
+
+        let requests =
+            RequestUsage { period_start: 100, payments_in_period: 3, escalations_in_period: 1 };
+        assert_eq!(
+            requests.rebased(100, 90),
+            RequestUsage { period_start: 90, payments_in_period: 3, escalations_in_period: 1 }
+        );
+        assert_eq!(
+            requests.rebased(110, 90),
+            RequestUsage { period_start: 90, ..Default::default() }
+        );
     }
 
     #[test]
