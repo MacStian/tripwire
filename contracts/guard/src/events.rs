@@ -35,6 +35,8 @@ pub enum Event {
     #[event_version("1.0.0")]
     WithdrawalFailed { receiver_id: AccountId, token_id: TokenKey, amount: U128, unallocated: bool },
 
+    /// `spent_in_period` is the period total right after this payment was debited, payouts
+    /// still in flight included.
     #[event_version("1.0.0")]
     PaymentExecuted {
         request_id: String,
