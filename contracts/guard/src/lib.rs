@@ -1,4 +1,4 @@
-//! Budget guard for a Sputnik DAO.
+//! Tripwire: a budget guard for a Sputnik DAO.
 //!
 //! The DAO funds the guard with a small budget. An agent asks the guard to pay. Inside the
 //! policy the guard pays from its budget. Outside the policy it files a Transfer proposal and
