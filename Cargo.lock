@@ -3280,6 +3280,7 @@ dependencies = [
  "near-api",
  "near-sandbox",
  "near-sdk",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

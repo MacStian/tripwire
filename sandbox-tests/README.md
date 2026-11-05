@@ -58,6 +58,7 @@ hash to this commit and that the sha256 of the bytes, in base58, equals the hash
 | `tests/harness.rs` | The setup above, including the empty key list of the guard |
 | `tests/payments.rs` | USDC and NEAR paid inside the policy with the agent key, `payment_executed`, a repeated `request_id` rejected |
 | `tests/escalation.rs` | Over the per-payment cap, over the period cap and to an unknown recipient: a Transfer proposal filed by the guard with a fixed description. Over the per-payment cap the council approves and the DAO pays |
+| `tests/auth.rs` | The agent key refused by the runtime for every other guard method (`MethodNameMismatch`), for other contracts (`ReceiverMismatch`) and with a deposit (`DepositWithFunctionCall`). Full access keys of other accounts get `ERR_UNAUTHORIZED_AGENT`. The council cannot skip the vote (`ERR_NOT_DAO`) but as guardian may freeze. Approved proposals change the policy and withdraw. Callbacks and `new` are private |
 | `tests/gas.rs` | Worst case gas of every call and callback against the static gas the guard reserves |
 
 ## Gas

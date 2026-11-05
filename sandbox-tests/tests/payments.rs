@@ -1,7 +1,9 @@
 //! E2-S2: in-policy payouts, signed by the agent with its function call key only.
 
 use anyhow::Result;
-use sandbox_tests::{check, event_names, events, returned, Harness, Options, NEAR, USDC};
+use sandbox_tests::{
+    check, check_panic, event_names, events, returned, Harness, Options, NEAR, USDC,
+};
 use serde_json::json;
 
 #[tokio::test]
@@ -37,7 +39,7 @@ async fn pays_usdc_inside_the_policy() -> Result<()> {
 
     // The same invoice again is rejected before anything moves.
     let again = h.request_payment("inv-1001", &h.vendor, Some(&h.usdc), 80 * USDC, None).await?;
-    assert!(format!("{:?}", again.failures()).contains("ERR_DUPLICATE_OR_INVALID_REQUEST_ID"));
+    check_panic(&again, "ERR_DUPLICATE_OR_INVALID_REQUEST_ID")?;
     assert_eq!(h.usdc_balance(&h.vendor).await?, 80 * USDC);
     Ok(())
 }
