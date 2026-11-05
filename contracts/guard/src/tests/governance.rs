@@ -45,6 +45,25 @@ fn update_policy_replaces_the_policy_and_emits_an_event() {
 }
 
 #[test]
+#[should_panic(expected = "ERR_INSUFFICIENT_NEAR_RESERVE")]
+fn update_policy_counts_the_growth_of_the_policy() {
+    // 0.005 NEAR above the reserve cannot pay for 49 more recipients (over 1 000 bytes).
+    let mut guard = guard_with(policy());
+    call_with_balance(DAO, NearToken::from_yoctonear(2 * NEAR + NEAR / 100 + NEAR / 200));
+    let mut recipients = policy().recipients;
+    recipients.extend((1..MAX_RECIPIENTS).map(|i| acc(&format!("vendor{i}.test.near"))));
+    guard.update_policy(Policy { recipients, ..policy() });
+}
+
+#[test]
+fn update_policy_of_the_same_size_needs_no_extra_reserve() {
+    let mut guard = guard_with(policy());
+    call_with_balance(DAO, NearToken::from_yoctonear(2 * NEAR + NEAR / 100 + NEAR / 200));
+    guard.update_policy(Policy { max_payments_per_period: 7, ..policy() });
+    assert_eq!(guard.get_policy().max_payments_per_period, 7);
+}
+
+#[test]
 #[should_panic(expected = "ERR_INVALID_POLICY: agents")]
 fn update_policy_validates_the_new_policy() {
     let mut guard = guard_with(policy());

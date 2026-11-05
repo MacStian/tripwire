@@ -30,6 +30,11 @@ pub enum Event {
     #[event_version("1.0.0")]
     ReserveWithdrawn { receiver_id: AccountId, amount: U128 },
 
+    /// The transfer of a withdrawal failed. A budget withdrawal is credited back, and for
+    /// `unallocated` NEAR the refund returns it to the guard.
+    #[event_version("1.0.0")]
+    WithdrawalFailed { receiver_id: AccountId, token_id: TokenKey, amount: U128, unallocated: bool },
+
     #[event_version("1.0.0")]
     PaymentExecuted {
         request_id: String,
