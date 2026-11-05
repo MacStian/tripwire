@@ -19,3 +19,8 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 cd contracts/guard && cargo near build non-reproducible-wasm
 ```
+
+## Security and license
+
+- `THREAT_MODEL.md`: assets, actors, threats, the check and the test behind each mitigation, and the residual risks
+- MIT, see `LICENSE`
