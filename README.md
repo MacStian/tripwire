@@ -56,7 +56,7 @@ Unused gas goes back to the allowance, so a request costs it only the gas burnt:
 | | Limits enforced by | Governed by | Request over the limit |
 | --- | --- | --- | --- |
 | Reviewer agent that votes on small payments ([Trezu #624](https://github.com/NEAR-DevHub/trezu/issues/624)) | Model judgement | Treasury members | The agent does not vote |
-| [OutLayer](https://github.com/out-layer/outlayer) agent custody | TEE | Wallet owner | Multisig approval in OutLayer |
+| [OutLayer](https://github.com/out-layer/outlayer/blob/main/docs/NON_CUSTODIAL.md) agent custody | TEE. Period caps are counted outside the enclave | Wallet owner | Multisig approval in OutLayer |
 | [Safe Allowance Module](https://docs.safe.global/home/ai-agent-quickstarts/agent-with-spending-limit), [Zodiac Roles v2](https://github.com/zodiaceco/zodiac-modifier-roles) (Ethereum) | Contract | Safe owners | Rejected |
 | **Tripwire** | Contract | Sputnik DAO proposals | Becomes a Sputnik proposal |
 
