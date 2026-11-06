@@ -127,10 +127,25 @@ With 0.1 NEAR for the gas of the account creations the master needs 14 NEAR it c
 `tests/deploy.rs` checks these numbers on a local node.
 
 1. Create the master account and put its key in the near CLI legacy keychain, at
-   `~/.near-credentials/testnet/<master>.json`.
-2. Fund it with 14 testnet NEAR. A fresh account needs nothing more, because accounts up to 770
-   bytes need no storage stake. An account with a contract or more state needs the stake for its
-   storage on top, 1 NEAR per 100 kB, less any locked NEAR.
+   `~/.near-credentials/testnet/<master>.json`. With [near CLI](https://github.com/near/near-cli-rs)
+   the faucet creates it with 10 NEAR:
+
+   ```sh
+   near account create-account sponsor-by-faucet-service <master> autogenerate-new-keypair \
+     save-to-legacy-keychain network-config testnet create
+   ```
+
+2. Fund it with 14 testnet NEAR. One way: create a second account the same way and delete it with
+   the master as the beneficiary, which moves all its NEAR to the master:
+
+   ```sh
+   near account delete-account <helper> beneficiary <master> network-config testnet \
+     sign-with-legacy-keychain send
+   ```
+
+   A fresh account needs nothing more, because accounts up to 770 bytes need no storage stake. An
+   account with a contract or more state needs the stake for its storage on top, 1 NEAR per
+   100 kB, less any locked NEAR.
 3. Run `scripts/deploy-testnet.sh <master>` on Linux or macOS (WSL on Windows), for example
    `scripts/deploy-testnet.sh tripwire-demo.testnet`. The deploy refuses to run elsewhere,
    because it cannot make the key files readable by the owner only there.
