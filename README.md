@@ -36,6 +36,21 @@ flowchart LR
 
 The worst case with a stolen agent key, or an agent that follows a poisoned invoice, is payments to allowlisted recipients up to the period cap, never more than the guard's budget. The treasury stays out of reach. The guard has no vote in the DAO, only a role that can add Transfer proposals, and the guard account has no access keys after deployment.
 
+## The agent key
+
+The agent signs every request with one NEAR function call access key, never a full access key. The deploy adds it to the agent account with these limits, and the NEAR runtime enforces them before the guard runs:
+
+| Limit | Value |
+| --- | --- |
+| Receiver | The guard account only |
+| Methods | `request_payment` only |
+| Deposit | None. A function call key cannot attach NEAR |
+| Gas allowance | 0.25 NEAR |
+
+A function call key signs only function calls, so it cannot transfer NEAR or add and delete keys. `tests/auth.rs` shows the runtime refusing the key for `update_policy`, `freeze`, `unfreeze` and the three withdrawals on the guard, for `ft_transfer` on the token and with a deposit. All it can do is ask the guard to pay, which leads to the worst case above.
+
+Unused gas goes back to the allowance, so a request costs it only the gas burnt: about 0.0006 NEAR on the local node, so 0.25 NEAR covers about 400 requests. When the allowance runs out the runtime refuses the key and the owner of the agent account adds a new one. That owner is the deploying master, whose full access key the agent account also holds. The agent process never gets it, because the deploy writes only the function call key to `agent.<master>.json`.
+
 ## Where it fits
 
 | | Limits enforced by | Governed by | Request over the limit |
