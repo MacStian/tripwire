@@ -1,0 +1,75 @@
+{
+  "network": "testnet",
+  "master": "macstian-tripwire.testnet",
+  "accounts": {
+    "council": "council.macstian-tripwire.testnet",
+    "dao": "dao.macstian-tripwire.testnet",
+    "guard": "guard.macstian-tripwire.testnet",
+    "usdc": "usdc.macstian-tripwire.testnet",
+    "agent": "agent.macstian-tripwire.testnet",
+    "vendor": "vendor.macstian-tripwire.testnet"
+  },
+  "contracts": {
+    "dao": {
+      "code_hash": "DtHZA1mUmGYeScEaUoUZYQGGFHSMpnjMCvkr5U9hJXuF",
+      "source": "near-daos/sputnik-dao-contract@2b0f34a3860460f285307ec2ccf36345acbe05a2"
+    },
+    "guard": {
+      "code_hash": "E9uSivdvoVBBsKsqJG1LhfrxxpZCGCCtsRXqc8csTFtq",
+      "source": "contracts/guard"
+    },
+    "usdc": {
+      "code_hash": "BS9RxQ4HKy5yW9xVnHTKwzoqbdSBqiAwSRARaa9ypSTw",
+      "source": "contracts/mock-ft"
+    }
+  },
+  "agent_key": {
+    "public_key": "ed25519:2KejuK9ERVfRVKThp8aSnAmrYftGdTHf27TJH6YW1aJf",
+    "receiver_id": "guard.macstian-tripwire.testnet",
+    "method_names": [
+      "request_payment"
+    ],
+    "allowance": "250000000000000000000000"
+  },
+  "guard_keys": [],
+  "budgets": {
+    "near": "1000000000000000000000000",
+    "usdc": "1000000000"
+  },
+  "guard_policy": {
+    "agents": [
+      "agent.macstian-tripwire.testnet"
+    ],
+    "recipients": [
+      "vendor.macstian-tripwire.testnet"
+    ],
+    "token_limits": [
+      {
+        "token_id": "usdc.macstian-tripwire.testnet",
+        "max_per_payment": "100000000",
+        "max_per_period": "300000000"
+      },
+      {
+        "token_id": null,
+        "max_per_payment": "1000000000000000000000000",
+        "max_per_period": "3000000000000000000000000"
+      }
+    ],
+    "period_seconds": 86400,
+    "period_anchor": 1793973698,
+    "expires_at": null,
+    "guardian": "council.macstian-tripwire.testnet",
+    "max_payments_per_period": 10,
+    "max_escalations_per_period": 5,
+    "proposal_bond": "100000000000000000000000",
+    "min_near_reserve": "1000000000000000000000000"
+  },
+  "explorer": {
+    "council": "https://testnet.nearblocks.io/address/council.macstian-tripwire.testnet",
+    "dao": "https://testnet.nearblocks.io/address/dao.macstian-tripwire.testnet",
+    "guard": "https://testnet.nearblocks.io/address/guard.macstian-tripwire.testnet",
+    "usdc": "https://testnet.nearblocks.io/address/usdc.macstian-tripwire.testnet",
+    "agent": "https://testnet.nearblocks.io/address/agent.macstian-tripwire.testnet",
+    "vendor": "https://testnet.nearblocks.io/address/vendor.macstian-tripwire.testnet"
+  }
+}
