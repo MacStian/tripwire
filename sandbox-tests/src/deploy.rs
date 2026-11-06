@@ -8,6 +8,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use near_api::signer::generate_secret_key;
@@ -21,10 +22,13 @@ use crate::{Deployment, Options, AGENT_KEY_ALLOWANCE, SPUTNIK_COMMIT};
 /// creations. Every other transaction is signed, and paid for, by the account it acts as.
 pub const GAS_MARGIN: NearToken = NearToken::from_millinear(100);
 
-/// NEAR the master must be able to spend for [`run`], on top of the stake for its own storage.
+/// NEAR the master must be able to spend for [`run`], see [`crate::spendable_balance`].
 pub fn required_balance(opts: &Options) -> NearToken {
     opts.balances.total().saturating_add(GAS_MARGIN)
 }
+
+/// Deadline of one RPC call, connection and full response, the same as near-api uses.
+pub const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Where the near CLI legacy keychain keeps the key of `id`.
 pub fn key_file(credentials: &Path, id: &AccountId) -> PathBuf {
@@ -110,7 +114,7 @@ pub async fn run(
 }
 
 /// Whether `id` exists, at final finality. Only the RPC's `UNKNOWN_ACCOUNT` counts as missing.
-/// Every other answer, a timeout or an RPC error, is an error.
+/// Every other answer, an RPC error or no full answer within [`RPC_TIMEOUT`], is an error.
 pub async fn account_exists(network: &NetworkConfig, id: &AccountId) -> Result<bool> {
     let rpc = network.rpc_endpoints.first().context("no RPC endpoint")?;
     let request = json!({
@@ -120,7 +124,9 @@ pub async fn account_exists(network: &NetworkConfig, id: &AccountId) -> Result<b
         "params": { "request_type": "view_account", "finality": "final", "account_id": id },
     });
     let response: Value = async {
-        let response = reqwest::Client::new().post(rpc.url.clone()).json(&request).send().await?;
+        let client =
+            reqwest::Client::builder().connect_timeout(RPC_TIMEOUT).timeout(RPC_TIMEOUT).build()?;
+        let response = client.post(rpc.url.clone()).json(&request).send().await?;
         response.error_for_status()?.json().await
     }
     .await

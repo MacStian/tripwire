@@ -58,6 +58,32 @@ pub const AGENT_GAS: NearGas = NearGas::from_tgas(100);
 
 /// Storage stake: 1 NEAR per 100 kB.
 pub const STORAGE_PRICE_PER_BYTE: u128 = 10u128.pow(19);
+/// Accounts that use at most this many bytes need no storage stake (zero balance accounts,
+/// NEP-448).
+pub const ZERO_BALANCE_ACCOUNT_STORAGE_LIMIT: u64 = 770;
+
+/// NEAR an account can spend under the protocol's storage rule: `amount + locked` must cover
+/// the stake for its storage after every transaction, unless the account is small enough to
+/// need none.
+pub fn spendable_balance(amount: NearToken, locked: NearToken, storage_usage: u64) -> NearToken {
+    if storage_usage <= ZERO_BALANCE_ACCOUNT_STORAGE_LIMIT {
+        return amount;
+    }
+    let stake = u128::from(storage_usage) * STORAGE_PRICE_PER_BYTE;
+    let uncovered = stake.saturating_sub(locked.as_yoctonear());
+    NearToken::from_yoctonear(amount.as_yoctonear().saturating_sub(uncovered))
+}
+
+/// [`spendable_balance`] of `id`, read from the network.
+pub async fn spendable(network: &NetworkConfig, id: &AccountId) -> Result<NearToken> {
+    let view = Account(id.clone())
+        .view()
+        .fetch_from(network)
+        .await
+        .with_context(|| format!("reading {id}"))?
+        .data;
+    Ok(spendable_balance(view.amount, view.locked, view.storage_usage))
+}
 
 const STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(10);
 const NO_DEPOSIT: NearToken = NearToken::from_yoctonear(0);
@@ -790,17 +816,9 @@ impl Deployment {
         self.view(&self.dao, "get_last_proposal_id", json!({})).await
     }
 
-    /// NEAR the account can spend: its balance less the stake for its storage. It leaves out the
-    /// storage exemption of small accounts, so it errs low.
+    /// NEAR the account can spend, see [`spendable_balance`].
     pub async fn spendable(&self, id: &AccountId) -> Result<NearToken> {
-        let view = Account(id.clone())
-            .view()
-            .fetch_from(&self.network)
-            .await
-            .with_context(|| format!("reading {id}"))?
-            .data;
-        let stake = u128::from(view.storage_usage) * STORAGE_PRICE_PER_BYTE;
-        Ok(NearToken::from_yoctonear(view.amount.as_yoctonear().saturating_sub(stake)))
+        spendable(&self.network, id).await
     }
 
     /// Bytes of storage the account uses.
