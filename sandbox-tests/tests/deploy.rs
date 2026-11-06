@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use near_api::types::transaction::result::ExecutionFinalResult;
@@ -14,7 +15,9 @@ use near_sandbox::config::{
 };
 use near_sandbox::Sandbox;
 use sandbox_tests::{
-    account, check, deploy, full, returned, Options, AGENT_GAS, NEAR, STORAGE_PRICE_PER_BYTE, USDC,
+    account, check, deploy, full, mock_ft_wasm, returned, spendable, spendable_balance, Options,
+    AGENT_GAS, AGENT_KEY_ALLOWANCE, NEAR, STORAGE_PRICE_PER_BYTE, USDC,
+    ZERO_BALANCE_ACCOUNT_STORAGE_LIMIT,
 };
 use serde_json::{json, Value};
 
@@ -66,21 +69,9 @@ async fn send(
     full(result)
 }
 
-/// Gives the master `balance` NEAR, plus the stake for its own storage when `plus_stake`.
-async fn fund_master(
-    sandbox: &Sandbox,
-    network: &NetworkConfig,
-    balance: NearToken,
-    plus_stake: bool,
-) -> Result<()> {
+/// A fresh master account with `balance` NEAR and the genesis key.
+async fn fund_master(sandbox: &Sandbox, balance: NearToken) -> Result<()> {
     sandbox.create_account(MASTER.parse()?).initial_balance(balance).send().await?;
-    if plus_stake {
-        let view = Account(account(MASTER)?).view().fetch_from(network).await?.data;
-        let stake =
-            NearToken::from_yoctonear(u128::from(view.storage_usage) * STORAGE_PRICE_PER_BYTE);
-        let balance = balance.saturating_add(stake);
-        sandbox.create_account(MASTER.parse()?).initial_balance(balance).send().await?;
-    }
     Ok(())
 }
 
@@ -96,7 +87,8 @@ async fn the_testnet_deploy_fits_its_balances_and_runs_the_demo() -> Result<()> 
     let sandbox = Sandbox::start_sandbox().await?;
     let network = NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
     let opts = Options::testnet();
-    fund_master(&sandbox, &network, deploy::required_balance(&opts), true).await?;
+    // A fresh account needs no storage stake, so exactly the required balance is enough.
+    fund_master(&sandbox, deploy::required_balance(&opts)).await?;
     let (dir, master) = master_key_file("full")?;
     assert_eq!(spendable(&network, &master).await?, deploy::required_balance(&opts));
 
@@ -167,6 +159,24 @@ async fn the_testnet_deploy_fits_its_balances_and_runs_the_demo() -> Result<()> 
             .await?;
     check(&outcome, "the escalation")?;
     let id = returned(&outcome)?["Escalated"]["proposal_id"].as_u64().unwrap();
+
+    // What the two requests took from the key's allowance, which limits the agent before its
+    // balance does.
+    let key = Account(d.agent.clone()).access_key(d.agent_key).fetch_from(&network).await?;
+    let AccessKeyPermission::FunctionCall(permission) = key.data.permission else {
+        panic!("the agent key must be a function call key");
+    };
+    let left = permission.allowance.expect("the agent key has an allowance");
+    let used = AGENT_KEY_ALLOWANCE.saturating_sub(left).as_yoctonear();
+    eprintln!(
+        "agent key allowance: {:.5} NEAR used by 2 requests at {} TGas, {:.5} NEAR left",
+        used as f64 / NEAR as f64,
+        AGENT_GAS.as_tgas(),
+        left.as_yoctonear() as f64 / NEAR as f64,
+    );
+    // Unused gas goes back to the allowance, so the key lasts for hundreds of requests.
+    assert!(used < NEAR / 100, "2 requests used {used} yoctoNEAR of the allowance");
+
     let kind = d.proposal(id).await?["kind"].clone();
     let vote = json!({ "id": id, "action": "VoteApprove", "proposal": kind });
     let gas = NearGas::from_tgas(300);
@@ -185,14 +195,44 @@ async fn the_testnet_deploy_fits_its_balances_and_runs_the_demo() -> Result<()> 
     Ok(())
 }
 
+#[test]
+fn spendable_balance_follows_the_storage_rules() {
+    let near = NearToken::from_near;
+    let zero = NearToken::from_yoctonear(0);
+    // Small accounts need no stake.
+    assert_eq!(spendable_balance(near(14), zero, ZERO_BALANCE_ACCOUNT_STORAGE_LIMIT), near(14));
+    // Above the limit every byte is staked: 100 kB lock 1 NEAR.
+    assert_eq!(spendable_balance(near(14), zero, 100_000), near(13));
+    // Locked NEAR counts toward the stake.
+    assert_eq!(spendable_balance(near(14), near(1), 100_000), near(14));
+    assert_eq!(
+        spendable_balance(near(14), NearToken::from_millinear(400), 100_000),
+        NearToken::from_millinear(13_400)
+    );
+    assert_eq!(spendable_balance(near(1), zero, 300_000), zero);
+    assert_eq!(STORAGE_PRICE_PER_BYTE * 100_000, NEAR);
+}
+
 #[tokio::test]
 async fn the_deploy_counts_only_what_the_master_can_spend() -> Result<()> {
     let sandbox = Sandbox::start_sandbox().await?;
     let network = NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
     let opts = Options::testnet();
-    // The balance is exactly what the deploy needs, but part of it backs the master's storage.
-    fund_master(&sandbox, &network, deploy::required_balance(&opts), false).await?;
+    let needed = deploy::required_balance(&opts);
+    // A master with a contract: its balance covers the setup, but part of it backs the code.
+    fund_master(&sandbox, needed.saturating_add(NearToken::from_near(1))).await?;
     let (dir, master) = master_key_file("short")?;
+    let signer = Signer::from_access_keyfile(deploy::key_file(&dir.0, &master))?;
+    let result = Contract::deploy(master.clone())
+        .use_code(mock_ft_wasm().to_vec())
+        .without_init_call()
+        .with_signer(signer)
+        .send_to(&network)
+        .await?;
+    check(&full(result)?, "deploying code on the master")?;
+    let view = Account(master.clone()).view().fetch_from(&network).await?.data;
+    assert!(view.amount >= needed, "the balance alone would pass");
+    assert!(spendable(&network, &master).await? < needed);
 
     let result = deploy::run(network.clone(), master.clone(), &dir.0, opts).await;
     let error = format!("{:#}", result.err().expect("a short master must be refused"));
@@ -207,23 +247,32 @@ async fn the_deploy_counts_only_what_the_master_can_spend() -> Result<()> {
 async fn the_account_check_takes_only_unknown_account_as_missing() -> Result<()> {
     let sandbox = Sandbox::start_sandbox().await?;
     let network = NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
+    let nobody = account("nobody.test.near")?;
     assert!(deploy::account_exists(&network, &account("sandbox")?).await?);
-    assert!(!deploy::account_exists(&network, &account("nobody.test.near")?).await?);
+    assert!(!deploy::account_exists(&network, &nobody).await?);
 
-    // An RPC that does not answer is an error, not a missing account, and the deploy stops.
-    let dead = NetworkConfig::from_rpc_url("dead", "http://127.0.0.1:9".parse()?);
-    let check = deploy::account_exists(&dead, &account("nobody.test.near")?).await;
-    assert!(check.is_err());
-    let (dir, master) = master_key_file("dead")?;
-    let result = deploy::run(dead, master, &dir.0, Options::testnet()).await;
+    // An RPC that refuses the connection is an error, not a missing account, and the deploy
+    // stops.
+    let refused = NetworkConfig::from_rpc_url("refused", "http://127.0.0.1:9".parse()?);
+    assert!(deploy::account_exists(&refused, &nobody).await.is_err());
+    let (dir, master) = master_key_file("refused")?;
+    let result = deploy::run(refused, master, &dir.0, Options::testnet()).await;
     let error = format!("{:#}", result.err().expect("the deploy must stop"));
     assert!(error.contains("checking whether"), "{error}");
-    Ok(())
-}
 
-/// NEAR the account can spend: its balance less the stake for its storage.
-async fn spendable(network: &NetworkConfig, id: &AccountId) -> Result<NearToken> {
-    let view = Account(id.clone()).view().fetch_from(network).await?.data;
-    let stake = u128::from(view.storage_usage) * STORAGE_PRICE_PER_BYTE;
-    Ok(NearToken::from_yoctonear(view.amount.as_yoctonear() - stake))
+    // An RPC that accepts the connection and never answers is an error after the deadline.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}", silent.local_addr()?);
+    let silent_network = NetworkConfig::from_rpc_url("silent", url.parse()?);
+    let started = Instant::now();
+    let check = tokio::time::timeout(
+        deploy::RPC_TIMEOUT + Duration::from_secs(10),
+        deploy::account_exists(&silent_network, &nobody),
+    )
+    .await
+    .expect("the account check must give up by itself");
+    assert!(check.is_err());
+    assert!(started.elapsed() >= deploy::RPC_TIMEOUT);
+    drop(silent);
+    Ok(())
 }
