@@ -92,7 +92,27 @@ The invoice agent and a one-command demo with three invoices are in progress: a 
 
 ## Testnet
 
-`scripts/deploy-testnet.sh <master account>` creates the same setup on testnet under a master account: the DAO from the pinned Sputnik wasm, the mock USDC token, the guard with its access keys removed, its budget and the agent key. It checks everything it can before the first transaction and writes `deployments/testnet.json` with the accounts, code hashes and explorer links. Steps and balances: `sandbox-tests/README.md`, section Testnet.
+The setup runs on testnet under `macstian-tripwire.testnet`:
+
+| Account | Role | Code hash |
+| --- | --- | --- |
+| [`guard.macstian-tripwire.testnet`](https://testnet.nearblocks.io/address/guard.macstian-tripwire.testnet) | The guard. No access keys, 1 NEAR and 1,000 USDC budget | `E9uSivdvoVBBsKsqJG1LhfrxxpZCGCCtsRXqc8csTFtq` |
+| [`dao.macstian-tripwire.testnet`](https://testnet.nearblocks.io/address/dao.macstian-tripwire.testnet) | Sputnik DAO v2 3.2, the code the mainnet factory deploys | `DtHZA1mUmGYeScEaUoUZYQGGFHSMpnjMCvkr5U9hJXuF` |
+| [`usdc.macstian-tripwire.testnet`](https://testnet.nearblocks.io/address/usdc.macstian-tripwire.testnet) | Mock USDC, 6 decimals | `BS9RxQ4HKy5yW9xVnHTKwzoqbdSBqiAwSRARaa9ypSTw` |
+| [`council.macstian-tripwire.testnet`](https://testnet.nearblocks.io/address/council.macstian-tripwire.testnet) | Only council member, also the guardian | |
+| [`agent.macstian-tripwire.testnet`](https://testnet.nearblocks.io/address/agent.macstian-tripwire.testnet) | Holds the agent's function call key | |
+| [`vendor.macstian-tripwire.testnet`](https://testnet.nearblocks.io/address/vendor.macstian-tripwire.testnet) | The one allowlisted recipient | |
+
+`deployments/testnet.json` holds the same accounts, the agent key, the policy and the budgets. Check them with [near CLI](https://github.com/near/near-cli-rs), no account needed:
+
+| Do | See |
+| --- | --- |
+| `near account list-keys guard.macstian-tripwire.testnet network-config testnet now` | An empty table: nobody holds a key to the guard |
+| `near account list-keys agent.macstian-tripwire.testnet network-config testnet now` | The agent key: `only do ["request_payment"] function calls on guard.macstian-tripwire.testnet with an allowance of 0.25 NEAR` |
+| `near contract call-function as-read-only guard.macstian-tripwire.testnet get_status json-args '{}' network-config testnet now` | The policy, the budgets, `"frozen": false` and this period's spending |
+| `near contract call-function as-read-only dao.macstian-tripwire.testnet get_policy json-args '{}' network-config testnet now` | The `GuardRequestor` role with only `transfer:AddProposal` for the guard |
+
+To build the same setup under your own account, move the committed `deployments/testnet.json` away and run `scripts/deploy-testnet.sh <master account>`. It checks everything it can before the first transaction and writes a new `deployments/testnet.json`. Steps and balances: `sandbox-tests/README.md`, section Testnet.
 
 ## Design decisions
 
@@ -122,6 +142,7 @@ The invoice agent and a one-command demo with three invoices are in progress: a 
 | `sandbox-tests` | End-to-end tests on a local node and the testnet deploy (`src/deploy.rs`, `src/bin/deploy.rs`) |
 | `sandbox-tests/res/sputnikdao2.wasm` | Sputnik DAO v2 3.2, the code the mainnet factory deploys |
 | `scripts/deploy-testnet.sh` | The testnet deploy |
+| `deployments/testnet.json` | What the testnet deploy created. No secrets |
 | `scripts/fetch_sputnik_wasm.py` | Downloads the Sputnik wasm again and checks it against the factory |
 
 Checks run before every change:
