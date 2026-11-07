@@ -15,7 +15,7 @@ An invoice is untrusted input. A poisoned invoice can tell the agent to pay anot
 
 ## How it works
 
-The DAO moves a small budget to the guard contract and sets its policy by proposal: the agents that may ask, the recipients that may be paid directly, per-payment and per-period caps for each token, an expiry and an optional guardian. The agent holds a NEAR function call key that can call `request_payment` on the guard and nothing else.
+The DAO moves a small budget to the guard contract and sets its policy by proposal: the agents that may ask, the recipients that may be paid directly, per-payment and per-period caps for each token, an expiry and an optional guardian. The guardian can freeze the guard at once without a vote, and only a DAO proposal unfreezes it. The agent holds a NEAR function call key that can call `request_payment` on the guard and nothing else.
 
 On every `request_payment` the guard does one of three things:
 
@@ -50,6 +50,21 @@ The agent signs every request with one NEAR function call access key, never a fu
 A function call key signs only function calls, so it cannot transfer NEAR or add and delete keys. `tests/auth.rs` shows the runtime refusing the key for `update_policy`, `freeze`, `unfreeze` and the three withdrawals on the guard, for `ft_transfer` on the token and with a deposit. All it can do is ask the guard to pay, which leads to the worst case above.
 
 Unused gas goes back to the allowance, so a request costs it only the gas burnt: about 0.0006 NEAR on the local node, so 0.25 NEAR covers about 400 requests. When the allowance runs out the runtime refuses the key and the owner of the agent account adds a new one. That owner is the deploying master, whose full access key the agent account also holds. The agent process never gets it, because the deploy writes only the function call key to `agent.<master>.json`.
+
+## What happens to an invoice
+
+Each invoice the agent sends has its own `request_id`. The guard handles a `request_id` once, so the same invoice is never paid twice, and `is_request_processed` tells whether the guard has seen it. Every invoice ends in one of these states, each with a record on chain:
+
+| State | What it means | Where to see it |
+| --- | --- | --- |
+| Paid | The vendor has the money, paid from the guard's budget | The agent's transaction with a `payment_executed` event: invoice id, recipient, token, amount and what the period has spent so far |
+| Waiting for a vote | Over a cap, or a recipient outside the allowlist. Nothing is paid yet | A `payment_escalated` event with the reason and the number of the DAO proposal. The proposal names the real recipient and amount |
+| Paid after a vote | The council approved the proposal and the DAO paid from its treasury | The vote transaction. The proposal is `Approved` |
+| Turned down by the council | The council rejected the proposal or let it expire | The proposal is `Rejected`, `Removed` or `Expired`. Nothing is paid |
+| Rejected by the guard | For example the guard is frozen, the grant expired, the invoice id was used before or the period's count is used up | The agent's transaction fails with the error code, for example `ERR_GRANT_EXPIRED`. Nothing is paid and nothing goes to a vote |
+| Failed, can be retried | The token transfer or the proposal did not go through | A `payment_failed` or `escalation_failed` event. The guard undoes what it counted for the invoice, the invoice id included, so the agent can send the same invoice again |
+
+The sample transactions under Testnet show the first three states.
 
 ## Where it fits
 
