@@ -1,17 +1,23 @@
-//! Sandbox harness for the guard.
+//! Setup and test harness for the guard.
 //!
-//! [`Harness::start`] runs a local NEAR node and sets up everything the guard works with: a real
-//! Sputnik DAO v2, a mock USDC token, the guard itself and an agent that only holds a function
-//! call key for `request_payment`. Every test starts its own node, so tests never share state.
+//! [`Deployment::create`] sets up everything the guard works with under one master account: a
+//! real Sputnik DAO v2, a mock USDC token, the guard itself and an agent that only holds a
+//! function call key for `request_payment`. It runs the same way on a local node and on
+//! testnet (see [`deploy`]). [`Harness::start`] runs it on a fresh local node. Every test starts
+//! its own node, so tests never share state.
 
+pub mod deploy;
+
+use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::Engine;
 use near_api::signer::generate_secret_key;
+use near_api::types::account::ContractState;
 use near_api::types::transaction::actions::FunctionCallPermission;
 use near_api::types::transaction::result::{ExecutionFinalResult, TransactionResult};
-use near_api::types::AccessKeyPermission;
+use near_api::types::{AccessKeyPermission, SecretKey};
 use near_api::{
     Account, AccountId, Chain, Contract, NearGas, NearToken, NetworkConfig, PublicKey, Signer,
 };
@@ -24,12 +30,16 @@ use serde_json::{json, Value};
 /// 3.2, commit 2b0f34a3860460f285307ec2ccf36345acbe05a2. `scripts/fetch_sputnik_wasm.py`
 /// downloads it again and checks it against the factory's code hash.
 pub const SPUTNIK_WASM: &[u8] = include_bytes!("../res/sputnikdao2.wasm");
+pub const SPUTNIK_COMMIT: &str = "2b0f34a3860460f285307ec2ccf36345acbe05a2";
 
 pub const NEAR: u128 = 10u128.pow(24);
 /// One USDC in base units of the mock token.
 pub const USDC: u128 = 10u128.pow(6);
 pub const USDC_DECIMALS: u8 = 6;
 
+/// Parent of the local accounts. The sandbox node runs its validator on it, so the harness
+/// creates the accounts with a state patch instead of through it.
+pub const MASTER: &str = "test.near";
 pub const COUNCIL: &str = "council.test.near";
 pub const DAO: &str = "dao.test.near";
 pub const GUARD: &str = "guard.test.near";
@@ -46,8 +56,78 @@ pub const AGENT_KEY_ALLOWANCE: NearToken = NearToken::from_millinear(250);
 /// Gas the agent attaches to `request_payment` in the scenario tests.
 pub const AGENT_GAS: NearGas = NearGas::from_tgas(100);
 
+/// Storage stake: 1 NEAR per 100 kB.
+pub const STORAGE_PRICE_PER_BYTE: u128 = 10u128.pow(19);
+/// Accounts that use at most this many bytes need no storage stake (zero balance accounts,
+/// NEP-448).
+pub const ZERO_BALANCE_ACCOUNT_STORAGE_LIMIT: u64 = 770;
+
+/// NEAR an account can spend under the protocol's storage rule: `amount + locked` must cover
+/// the stake for its storage after every transaction, unless the account is small enough to
+/// need none.
+pub fn spendable_balance(amount: NearToken, locked: NearToken, storage_usage: u64) -> NearToken {
+    if storage_usage <= ZERO_BALANCE_ACCOUNT_STORAGE_LIMIT {
+        return amount;
+    }
+    let stake = u128::from(storage_usage) * STORAGE_PRICE_PER_BYTE;
+    let uncovered = stake.saturating_sub(locked.as_yoctonear());
+    NearToken::from_yoctonear(amount.as_yoctonear().saturating_sub(uncovered))
+}
+
+/// [`spendable_balance`] of `id`, read from the network.
+pub async fn spendable(network: &NetworkConfig, id: &AccountId) -> Result<NearToken> {
+    let view = Account(id.clone())
+        .view()
+        .fetch_from(network)
+        .await
+        .with_context(|| format!("reading {id}"))?
+        .data;
+    Ok(spendable_balance(view.amount, view.locked, view.storage_usage))
+}
+
 const STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(10);
 const NO_DEPOSIT: NearToken = NearToken::from_yoctonear(0);
+
+/// NEAR each account gets when the setup creates it.
+#[derive(Clone, Copy, Debug)]
+pub struct Balances {
+    pub council: NearToken,
+    pub dao: NearToken,
+    pub guard: NearToken,
+    pub usdc: NearToken,
+    pub agent: NearToken,
+    pub vendor: NearToken,
+}
+
+impl Balances {
+    /// Plenty, for the tests.
+    pub const LOCAL: Self = Self {
+        council: NearToken::from_near(100),
+        dao: NearToken::from_near(100),
+        guard: NearToken::from_near(20),
+        usdc: NearToken::from_near(20),
+        agent: NearToken::from_near(5),
+        vendor: NearToken::from_near(5),
+    };
+
+    /// Enough for the testnet demo. Contract code is staked at 1 NEAR per 100 kB: Sputnik
+    /// 444 kB, guard 218 kB, mock token 153 kB. The DAO also pays the 1 NEAR budget of
+    /// [`Options::testnet`], and the guard keeps its `min_near_reserve` of 1 NEAR plus room for
+    /// a few proposal bonds.
+    pub const TESTNET: Self = Self {
+        council: NearToken::from_millinear(1_000),
+        dao: NearToken::from_millinear(6_500),
+        guard: NearToken::from_millinear(3_800),
+        usdc: NearToken::from_millinear(2_000),
+        agent: NearToken::from_millinear(500),
+        vendor: NearToken::from_millinear(100),
+    };
+
+    pub fn total(&self) -> NearToken {
+        let all = [self.council, self.dao, self.guard, self.usdc, self.agent, self.vendor];
+        NearToken::from_yoctonear(all.iter().map(NearToken::as_yoctonear).sum())
+    }
+}
 
 /// Setup choices. `Options::default()` matches the scenarios in the E2 epic.
 #[derive(Clone, Copy)]
@@ -59,8 +139,9 @@ pub struct Options {
     /// USDC in base units the DAO moves into the guard budget with `ft_transfer_call`.
     /// Zero skips it.
     pub usdc_budget: u128,
-    /// Edits the default guard policy (see [`default_policy`]) before `new`.
+    /// Edits the default guard policy (see [`Deployment::default_policy`]) before `new`.
     pub policy: fn(&mut Value),
+    pub balances: Balances,
 }
 
 impl Default for Options {
@@ -70,54 +151,35 @@ impl Default for Options {
             near_budget: NearToken::from_near(5),
             usdc_budget: 1_000 * USDC,
             policy: |_| {},
+            balances: Balances::LOCAL,
         }
     }
 }
 
-/// The guard policy every test starts from, anchored at `now_sec`.
-///
-/// USDC: 100 per payment, 300 per period. NEAR: 1 per payment, 3 per period. One day periods,
-/// 10 payouts and 5 escalations per period, the council as guardian.
-pub fn default_policy(now_sec: u64, proposal_bond: NearToken) -> Value {
-    json!({
-        "agents": [AGENT],
-        "recipients": [VENDOR],
-        "token_limits": [
-            {
-                "token_id": USDC_TOKEN,
-                "max_per_payment": (100 * USDC).to_string(),
-                "max_per_period": (300 * USDC).to_string(),
-            },
-            {
-                "token_id": null,
-                "max_per_payment": NEAR.to_string(),
-                "max_per_period": (3 * NEAR).to_string(),
-            },
-        ],
-        "period_seconds": 86_400,
-        "period_anchor": now_sec,
-        "expires_at": null,
-        "guardian": COUNCIL,
-        "max_payments_per_period": 10,
-        "max_escalations_per_period": 5,
-        "proposal_bond": proposal_bond.as_yoctonear().to_string(),
-        "min_near_reserve": NEAR.to_string(),
-    })
+impl Options {
+    /// The testnet demo: the default policy with a 1 NEAR and 1,000 USDC budget.
+    pub fn testnet() -> Self {
+        Self {
+            near_budget: NearToken::from_near(1),
+            balances: Balances::TESTNET,
+            ..Self::default()
+        }
+    }
 }
 
 /// Sputnik policy with a one member council and the guard role.
-pub fn dao_policy(proposal_bond: NearToken) -> Value {
+pub fn dao_policy(council: &AccountId, guard: &AccountId, proposal_bond: NearToken) -> Value {
     json!({
         "roles": [
             {
                 "name": "council",
-                "kind": { "Group": [COUNCIL] },
+                "kind": { "Group": [council] },
                 "permissions": ["*:*"],
                 "vote_policy": {},
             },
             {
                 "name": GUARD_ROLE,
-                "kind": { "Group": [GUARD] },
+                "kind": { "Group": [guard] },
                 "permissions": ["transfer:AddProposal"],
                 "vote_policy": {},
             },
@@ -142,13 +204,13 @@ fn build_once(cell: &'static OnceLock<Vec<u8>>, manifest: &str) -> &'static [u8]
     })
 }
 
-/// The guard wasm, built once per test binary with `cargo near build`.
+/// The guard wasm, built once per process with `cargo near build`.
 pub fn guard_wasm() -> &'static [u8] {
     static WASM: OnceLock<Vec<u8>> = OnceLock::new();
     build_once(&WASM, concat!(env!("CARGO_MANIFEST_DIR"), "/../contracts/guard/Cargo.toml"))
 }
 
-/// The mock token wasm, built once per test binary.
+/// The mock token wasm, built once per process.
 pub fn mock_ft_wasm() -> &'static [u8] {
     static WASM: OnceLock<Vec<u8>> = OnceLock::new();
     build_once(&WASM, concat!(env!("CARGO_MANIFEST_DIR"), "/../contracts/mock-ft/Cargo.toml"))
@@ -158,7 +220,8 @@ pub fn account(id: &str) -> Result<AccountId> {
     id.parse().with_context(|| format!("invalid account id {id}"))
 }
 
-fn full(result: TransactionResult) -> Result<ExecutionFinalResult> {
+/// The final outcome of a transaction sent with near-api.
+pub fn full(result: TransactionResult) -> Result<ExecutionFinalResult> {
     result.into_full().ok_or_else(|| anyhow!("transaction is still pending"))
 }
 
@@ -233,15 +296,18 @@ pub fn returned(outcome: &ExecutionFinalResult) -> Result<Value> {
     Ok(outcome.clone().json::<Value>()?)
 }
 
-pub struct Harness {
-    /// Keeps the node alive. Dropping the harness stops it.
-    pub sandbox: Sandbox,
+/// Everything the setup created, and the keys to drive it.
+pub struct Deployment {
     pub network: NetworkConfig,
-    /// Full access key of every account the harness creates.
+    /// Full access key of the master. Every account the setup creates gets the same key, and
+    /// the guard loses it after `new`.
     pub signer: Arc<Signer>,
     /// Holds only the agent's function call key.
     pub agent_signer: Arc<Signer>,
     pub agent_key: PublicKey,
+    /// Secret of the agent's function call key, for the agent process.
+    pub agent_secret: SecretKey,
+    pub master: AccountId,
     pub council: AccountId,
     pub dao: AccountId,
     pub guard: AccountId,
@@ -251,61 +317,146 @@ pub struct Harness {
     pub proposal_bond: NearToken,
 }
 
-impl Harness {
-    /// Starts a node and runs the full E2-S1 setup:
-    /// 1. accounts for the council, DAO, guard, token, agent and vendor,
-    /// 2. the Sputnik DAO with the council and the `GuardRequestor` role,
-    /// 3. the USDC mock with storage for the DAO, guard and vendor, and USDC minted to the DAO,
-    /// 4. the guard with the default policy, funded through approved DAO proposals,
-    /// 5. the guard account locked: every access key deleted after `new`,
-    /// 6. a function call key for the agent, limited to `request_payment` on the guard.
-    pub async fn start(opts: Options) -> Result<Self> {
-        let sandbox = Sandbox::start_sandbox().await.context("starting the sandbox")?;
-        let network = NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
-        let signer = Signer::from_secret_key(DEFAULT_GENESIS_ACCOUNT_PRIVATE_KEY.parse()?)?;
+impl Deployment {
+    /// The accounts the setup creates under `master`, in creation order.
+    pub fn account_names(master: &AccountId) -> Result<[AccountId; 6]> {
+        let sub = |name: &str| account(&format!("{name}.{master}"));
+        Ok([
+            sub("council")?,
+            sub("dao")?,
+            sub("guard")?,
+            sub("usdc")?,
+            sub("agent")?,
+            sub("vendor")?,
+        ])
+    }
 
-        for (id, near) in
-            [(COUNCIL, 100), (DAO, 100), (GUARD, 20), (USDC_TOKEN, 20), (AGENT, 5), (VENDOR, 5)]
-        {
-            sandbox
-                .create_account(id.parse()?)
-                .initial_balance(NearToken::from_near(near))
-                .send()
-                .await
-                .with_context(|| format!("creating {id}"))?;
+    /// Runs the full setup under `master`, which signs with `signer`:
+    /// 1. subaccounts `council`, `dao`, `guard`, `usdc`, `agent` and `vendor` with the master key
+    ///    and the NEAR of `opts.balances`, paid by the master,
+    /// 2. to 7. [`Deployment::set_up`].
+    pub async fn create(
+        network: NetworkConfig,
+        master: AccountId,
+        signer: Arc<Signer>,
+        opts: Options,
+    ) -> Result<Self> {
+        let deployment = Self::new(network, master, signer, opts.proposal_bond)?;
+        deployment.create_accounts(&opts.balances).await?;
+        deployment.set_up(&opts).await?;
+        Ok(deployment)
+    }
+
+    /// Step 1 of [`Deployment::create`]: the six subaccounts, funded by the master.
+    pub async fn create_accounts(&self, balances: &Balances) -> Result<()> {
+        for (id, balance) in self.balances(balances) {
+            self.create_subaccount(id, balance).await?;
         }
+        Ok(())
+    }
 
+    /// The account ids under `master` and a new agent key. Sends nothing.
+    pub fn new(
+        network: NetworkConfig,
+        master: AccountId,
+        signer: Arc<Signer>,
+        proposal_bond: NearToken,
+    ) -> Result<Self> {
+        let [council, dao, guard, usdc, agent, vendor] = Self::account_names(&master)?;
         let agent_secret = generate_secret_key()?;
-        let agent_key = agent_secret.public_key();
-        let agent_signer = Signer::from_secret_key(agent_secret)?;
-
-        let harness = Self {
-            sandbox,
+        Ok(Self {
             network,
             signer,
-            agent_signer,
-            agent_key,
-            council: account(COUNCIL)?,
-            dao: account(DAO)?,
-            guard: account(GUARD)?,
-            usdc: account(USDC_TOKEN)?,
-            agent: account(AGENT)?,
-            vendor: account(VENDOR)?,
-            proposal_bond: opts.proposal_bond,
-        };
-        harness.deploy_dao().await?;
-        harness.deploy_usdc().await?;
-        harness.deploy_guard(opts.policy).await?;
-        harness.lock_guard().await?;
-        harness.fund_guard(opts.near_budget, opts.usdc_budget).await?;
-        harness.add_agent_key().await?;
-        Ok(harness)
+            agent_signer: Signer::from_secret_key(agent_secret.clone())?,
+            agent_key: agent_secret.public_key(),
+            agent_secret,
+            master,
+            council,
+            dao,
+            guard,
+            usdc,
+            agent,
+            vendor,
+            proposal_bond,
+        })
+    }
+
+    /// Each account with the NEAR it starts with.
+    pub fn balances(&self, b: &Balances) -> [(&AccountId, NearToken); 6] {
+        [
+            (&self.council, b.council),
+            (&self.dao, b.dao),
+            (&self.guard, b.guard),
+            (&self.usdc, b.usdc),
+            (&self.agent, b.agent),
+            (&self.vendor, b.vendor),
+        ]
+    }
+
+    /// Sets up the contracts on accounts that exist and hold the signer's key:
+    /// 2. the Sputnik DAO with the council and the `GuardRequestor` role,
+    /// 3. the USDC mock with storage for the DAO, guard and vendor, and USDC minted to the DAO,
+    /// 4. the guard with the default policy,
+    /// 5. the guard account locked: every access key deleted after `new`, and checked,
+    /// 6. the guard budget funded through approved DAO proposals,
+    /// 7. a function call key for the agent, limited to `request_payment` on the guard.
+    pub async fn set_up(&self, opts: &Options) -> Result<()> {
+        self.deploy_dao().await?;
+        self.deploy_usdc().await?;
+        self.deploy_guard(opts.policy).await?;
+        self.lock_guard().await?;
+        self.fund_guard(opts.near_budget, opts.usdc_budget).await?;
+        self.add_agent_key().await
+    }
+
+    /// Creates a subaccount of the master that holds the master key.
+    pub async fn create_subaccount(&self, id: &AccountId, balance: NearToken) -> Result<()> {
+        ensure!(id.is_sub_account_of(&self.master), "{id} is not a subaccount of {}", self.master);
+        let key = self.signer.get_public_key().await?;
+        let result = Account::create_account(id.clone())
+            .fund_myself(self.master.clone(), balance)
+            .with_public_key(key)
+            .with_signer(self.signer.clone())
+            .send_to(&self.network)
+            .await?;
+        check(&full(result)?, &format!("creating {id}"))
+    }
+
+    /// The guard policy the setup starts from, anchored at `now_sec`.
+    ///
+    /// USDC: 100 per payment, 300 per period. NEAR: 1 per payment, 3 per period. One day
+    /// periods, 10 payouts and 5 escalations per period, the council as guardian.
+    pub fn default_policy(&self, now_sec: u64) -> Value {
+        json!({
+            "agents": [self.agent],
+            "recipients": [self.vendor],
+            "token_limits": [
+                {
+                    "token_id": self.usdc,
+                    "max_per_payment": (100 * USDC).to_string(),
+                    "max_per_period": (300 * USDC).to_string(),
+                },
+                {
+                    "token_id": null,
+                    "max_per_payment": NEAR.to_string(),
+                    "max_per_period": (3 * NEAR).to_string(),
+                },
+            ],
+            "period_seconds": 86_400,
+            "period_anchor": now_sec,
+            "expires_at": null,
+            "guardian": self.council,
+            "max_payments_per_period": 10,
+            "max_escalations_per_period": 5,
+            "proposal_bond": self.proposal_bond.as_yoctonear().to_string(),
+            "min_near_reserve": NEAR.to_string(),
+        })
     }
 
     async fn deploy_dao(&self) -> Result<()> {
-        let config =
-            json!({ "name": "tripwire", "purpose": "Tripwire sandbox tests", "metadata": "" });
-        let args = json!({ "config": config, "policy": dao_policy(self.proposal_bond) });
+        let config = json!({ "name": "tripwire", "purpose": "Tripwire demo DAO", "metadata": "" });
+        let policy = dao_policy(&self.council, &self.guard, self.proposal_bond);
+        let args = json!({ "config": config, "policy": policy });
         self.deploy(&self.dao, SPUTNIK_WASM, args).await
     }
 
@@ -322,14 +473,14 @@ impl Harness {
     }
 
     async fn deploy_guard(&self, edit_policy: fn(&mut Value)) -> Result<()> {
-        let mut policy = default_policy(self.now_sec().await?, self.proposal_bond);
+        let mut policy = self.default_policy(self.now_sec().await?);
         edit_policy(&mut policy);
         let args = json!({ "dao_id": self.dao, "policy": policy });
         self.deploy(&self.guard, guard_wasm(), args).await
     }
 
-    /// Deletes every access key of the guard. From here on only its own code can move its
-    /// funds, and nobody can redeploy it.
+    /// Deletes every access key of the guard and checks that none is left. From here on only
+    /// its own code can move its funds, and nobody can redeploy it.
     async fn lock_guard(&self) -> Result<()> {
         let keys = self.access_keys(&self.guard).await?;
         let result = Account(self.guard.clone())
@@ -337,7 +488,10 @@ impl Harness {
             .with_signer(self.signer.clone())
             .send_to(&self.network)
             .await?;
-        check(&full(result)?, "deleting the guard keys")
+        check(&full(result)?, "deleting the guard keys")?;
+        let left = self.access_keys(&self.guard).await?;
+        ensure!(left.is_empty(), "the guard still has access keys: {left:?}");
+        Ok(())
     }
 
     async fn fund_guard(&self, near: NearToken, usdc: u128) -> Result<()> {
@@ -363,12 +517,22 @@ impl Harness {
             receiver_id: self.guard.to_string(),
             method_names: vec!["request_payment".to_string()],
         });
-        let result = Account(self.agent.clone())
-            .add_key(permission, self.agent_key)
+        self.add_key(&self.agent, permission, self.agent_key).await
+    }
+
+    /// Adds `key` to `id`, signing with the master key the account holds.
+    pub async fn add_key(
+        &self,
+        id: &AccountId,
+        permission: AccessKeyPermission,
+        key: PublicKey,
+    ) -> Result<()> {
+        let result = Account(id.clone())
+            .add_key(permission, key)
             .with_signer(self.signer.clone())
             .send_to(&self.network)
             .await?;
-        check(&full(result)?, "adding the agent key")
+        check(&full(result)?, &format!("adding a key to {id}"))
     }
 
     async fn deploy(&self, id: &AccountId, wasm: &[u8], init_args: Value) -> Result<()> {
@@ -391,45 +555,25 @@ impl Harness {
         check(&outcome, &format!("registering {holder} on {token}"))
     }
 
-    /// Creates another mock token at `id`, with storage for the guard and the council and
-    /// `council_balance` minted to the council. It is in no guard policy.
-    pub async fn create_token(&self, id: &str, council_balance: u128) -> Result<AccountId> {
-        let token = account(id)?;
-        self.sandbox
-            .create_account(id.parse()?)
-            .initial_balance(NearToken::from_near(20))
-            .send()
-            .await
-            .with_context(|| format!("creating {id}"))?;
+    /// Deploys another mock token on `token`, an account with the signer's key, with storage
+    /// for the guard and the council and `council_balance` minted to the council. It is in no
+    /// guard policy.
+    pub async fn deploy_token(&self, token: &AccountId, council_balance: u128) -> Result<()> {
         let args = json!({ "symbol": "FAKE", "decimals": USDC_DECIMALS });
-        self.deploy(&token, mock_ft_wasm(), args).await?;
+        self.deploy(token, mock_ft_wasm(), args).await?;
         for holder in [&self.guard, &self.council] {
-            self.register(&token, holder).await?;
+            self.register(token, holder).await?;
         }
         let args = json!({ "account_id": self.council, "amount": council_balance.to_string() });
         let gas = NearGas::from_tgas(30);
-        let outcome = self.call(&token, &token, "mint", args, NO_DEPOSIT, gas).await?;
-        check(&outcome, &format!("minting {id} to the council"))?;
-        Ok(token)
+        let outcome = self.call(token, token, "mint", args, NO_DEPOSIT, gas).await?;
+        check(&outcome, &format!("minting {token} to the council"))
     }
 
     /// Current block time in seconds, the clock the guard sees.
     pub async fn now_sec(&self) -> Result<u64> {
         let block = Chain::block().fetch_from(&self.network).await?;
         Ok(block.header.timestamp / 1_000_000_000)
-    }
-
-    /// Moves the chain clock to at least `target_sec` with sandbox fast forward, which
-    /// produces the blocks at once instead of waiting for real time.
-    pub async fn advance_to(&self, target_sec: u64) -> Result<()> {
-        for _ in 0..30 {
-            let now = self.now_sec().await?;
-            if now >= target_sec {
-                return Ok(());
-            }
-            self.sandbox.fast_forward(target_sec - now).await?;
-        }
-        bail!("the chain clock did not reach {target_sec}")
     }
 
     pub async fn view<T>(&self, contract: &AccountId, method: &str, args: Value) -> Result<T>
@@ -466,7 +610,7 @@ impl Harness {
         full(result)
     }
 
-    /// Like [`Harness::call`], but fails when any receipt failed.
+    /// Like [`Deployment::call`], but fails when any receipt failed.
     pub async fn call_ok(
         &self,
         signer_id: &AccountId,
@@ -533,8 +677,9 @@ impl Harness {
             "method": "send_tx",
             "params": { "signed_tx_base64": encoded, "wait_until": "EXECUTED_OPTIMISTIC" },
         });
+        let rpc = self.network.rpc_endpoints.first().context("no RPC endpoint")?;
         let response: Value = reqwest::Client::new()
-            .post(&self.sandbox.rpc_addr)
+            .post(rpc.url.clone())
             .json(&request)
             .send()
             .await?
@@ -594,7 +739,7 @@ impl Harness {
         self.agent_call(&self.guard, "request_payment", args, NO_DEPOSIT, gas).await
     }
 
-    /// [`Harness::request_payment_with_gas`] with [`AGENT_GAS`].
+    /// [`Deployment::request_payment_with_gas`] with [`AGENT_GAS`].
     pub async fn request_payment(
         &self,
         request_id: &str,
@@ -643,7 +788,7 @@ impl Harness {
         Ok((id, self.approve(id).await?))
     }
 
-    /// Like [`Harness::dao_function_call_outcome`], but fails unless the call ran and the
+    /// Like [`Deployment::dao_function_call_outcome`], but fails unless the call ran and the
     /// proposal ended as `Approved`.
     pub async fn dao_function_call(
         &self,
@@ -671,9 +816,23 @@ impl Harness {
         self.view(&self.dao, "get_last_proposal_id", json!({})).await
     }
 
+    /// NEAR the account can spend, see [`spendable_balance`].
+    pub async fn spendable(&self, id: &AccountId) -> Result<NearToken> {
+        spendable(&self.network, id).await
+    }
+
     /// Bytes of storage the account uses.
     pub async fn storage_usage(&self, id: &AccountId) -> Result<u64> {
         Ok(Account(id.clone()).view().fetch_from(&self.network).await?.data.storage_usage)
+    }
+
+    /// Base58 hash of the code deployed on the account.
+    pub async fn code_hash(&self, id: &AccountId) -> Result<String> {
+        let view = Account(id.clone()).view().fetch_from(&self.network).await?;
+        match view.data.contract_state {
+            ContractState::LocalHash(hash) => Ok(hash.to_string()),
+            other => bail!("{id} has no code of its own: {other:?}"),
+        }
     }
 
     pub async fn guard_status(&self) -> Result<Value> {
@@ -699,5 +858,68 @@ impl Harness {
 
     pub async fn near_balance(&self, holder: &AccountId) -> Result<NearToken> {
         Ok(Account(holder.clone()).view().fetch_from(&self.network).await?.data.amount)
+    }
+}
+
+/// A local node with the full setup under [`MASTER`]. Derefs to the [`Deployment`].
+pub struct Harness {
+    /// Keeps the node alive. Dropping the harness stops it.
+    pub sandbox: Sandbox,
+    pub deployment: Deployment,
+}
+
+impl Deref for Harness {
+    type Target = Deployment;
+
+    fn deref(&self) -> &Deployment {
+        &self.deployment
+    }
+}
+
+impl Harness {
+    /// Starts a node, creates the accounts under [`MASTER`] with the genesis key and the NEAR
+    /// of `opts.balances`, and runs [`Deployment::set_up`] on them.
+    pub async fn start(opts: Options) -> Result<Self> {
+        let sandbox = Sandbox::start_sandbox().await.context("starting the sandbox")?;
+        let network = NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
+        let signer = Signer::from_secret_key(DEFAULT_GENESIS_ACCOUNT_PRIVATE_KEY.parse()?)?;
+        let deployment = Deployment::new(network, account(MASTER)?, signer, opts.proposal_bond)?;
+        let harness = Self { sandbox, deployment };
+        for (id, balance) in harness.balances(&opts.balances) {
+            harness.create_account(id, balance).await?;
+        }
+        harness.set_up(&opts).await?;
+        Ok(harness)
+    }
+
+    /// Creates an account with the genesis key through a state patch.
+    pub async fn create_account(&self, id: &AccountId, balance: NearToken) -> Result<()> {
+        self.sandbox
+            .create_account(id.as_str().parse()?)
+            .initial_balance(balance)
+            .send()
+            .await
+            .with_context(|| format!("creating {id}"))
+    }
+
+    /// Creates another mock token at `id` (see [`Deployment::deploy_token`]).
+    pub async fn create_token(&self, id: &str, council_balance: u128) -> Result<AccountId> {
+        let token = account(id)?;
+        self.create_account(&token, NearToken::from_near(20)).await?;
+        self.deploy_token(&token, council_balance).await?;
+        Ok(token)
+    }
+
+    /// Moves the chain clock to at least `target_sec` with sandbox fast forward, which
+    /// produces the blocks at once instead of waiting for real time.
+    pub async fn advance_to(&self, target_sec: u64) -> Result<()> {
+        for _ in 0..30 {
+            let now = self.now_sec().await?;
+            if now >= target_sec {
+                return Ok(());
+            }
+            self.sandbox.fast_forward(target_sec - now).await?;
+        }
+        bail!("the chain clock did not reach {target_sec}")
     }
 }

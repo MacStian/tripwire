@@ -69,6 +69,7 @@ async fn custom_bond_and_no_funding() -> anyhow::Result<()> {
         near_budget: NearToken::from_near(0),
         usdc_budget: 0,
         policy: |policy| policy["max_escalations_per_period"] = json!(1),
+        ..Options::default()
     };
     let h = Harness::start(opts).await?;
 
