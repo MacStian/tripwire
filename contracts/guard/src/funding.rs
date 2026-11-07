@@ -1,20 +1,14 @@
 //! Funding the budgets and DAO withdrawals.
 
 use near_sdk::json_types::U128;
-use near_sdk::{env, ext_contract, near, require, AccountId, NearToken, Promise, PromiseOrValue};
+use near_sdk::{env, near, require, AccountId, NearToken, Promise, PromiseOrValue};
 
 use crate::events::Event;
+use crate::external::ext_ft;
 use crate::{
     promise_succeeded, Guard, GuardExt, TokenKey, GAS_FAIL_WITHDRAWAL, GAS_FT_TRANSFER,
     GAS_ON_WITHDRAW,
 };
-
-// Only the generated ext_ft module is used, not the trait itself.
-#[ext_contract(ext_ft)]
-#[allow(dead_code)]
-trait FungibleToken {
-    fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>);
-}
 
 /// Where a withdrawal takes funds from. Passed to `on_withdraw_complete`.
 #[near(serializers = [json])]

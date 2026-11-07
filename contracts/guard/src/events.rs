@@ -3,7 +3,7 @@
 use near_sdk::json_types::U128;
 use near_sdk::{near, AccountId};
 
-use crate::TokenKey;
+use crate::{EscalationReason, TokenKey};
 
 #[near(event_json(standard = "tripwire"))]
 pub enum Event {
@@ -34,4 +34,39 @@ pub enum Event {
     /// `unallocated` NEAR the refund returns it to the guard.
     #[event_version("1.0.0")]
     WithdrawalFailed { receiver_id: AccountId, token_id: TokenKey, amount: U128, unallocated: bool },
+
+    /// `spent_in_period` is the period total right after this payment was debited, payouts
+    /// still in flight included.
+    #[event_version("1.0.0")]
+    PaymentExecuted {
+        request_id: String,
+        agent: AccountId,
+        recipient: AccountId,
+        token_id: TokenKey,
+        amount: U128,
+        spent_in_period: U128,
+    },
+
+    #[event_version("1.0.0")]
+    PaymentFailed { request_id: String, recipient: AccountId, token_id: TokenKey, amount: U128 },
+
+    #[event_version("1.0.0")]
+    PaymentEscalated {
+        request_id: String,
+        agent: AccountId,
+        recipient: AccountId,
+        token_id: TokenKey,
+        amount: U128,
+        reason: EscalationReason,
+        proposal_id: Option<u64>,
+    },
+
+    #[event_version("1.0.0")]
+    EscalationFailed {
+        request_id: String,
+        recipient: AccountId,
+        token_id: TokenKey,
+        amount: U128,
+        reason: EscalationReason,
+    },
 }

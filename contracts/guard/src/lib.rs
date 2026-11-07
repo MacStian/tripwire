@@ -5,13 +5,20 @@
 //! humans vote. Only the DAO can change the policy, unfreeze the guard or withdraw funds.
 //! Specification: `docs/contract-spec.md` in the planning repo.
 
+mod escalation;
 pub mod events;
+mod external;
 mod funding;
 mod governance;
+mod payout;
 mod policy;
+mod request;
 
+pub use escalation::{clean_memo, proposal_description, MAX_NOTE_LEN};
+pub use external::{ProposalInput, ProposalKind};
 pub use funding::Withdrawal;
 pub use policy::*;
+pub use request::*;
 
 use near_sdk::json_types::U128;
 use near_sdk::store::{LookupMap, LookupSet};
@@ -21,6 +28,9 @@ use near_sdk::{env, near, require, AccountId, BorshStorageKey, Gas, PanicOnDefau
 pub(crate) const GAS_FT_TRANSFER: Gas = Gas::from_tgas(15);
 pub(crate) const GAS_ON_WITHDRAW: Gas = Gas::from_tgas(15);
 pub(crate) const GAS_FAIL_WITHDRAWAL: Gas = Gas::from_tgas(5);
+pub(crate) const GAS_ON_PAYOUT: Gas = Gas::from_tgas(10);
+pub(crate) const GAS_ADD_PROPOSAL: Gas = Gas::from_tgas(25);
+pub(crate) const GAS_ON_ESCALATION: Gas = Gas::from_tgas(10);
 
 #[near(serializers = [borsh])]
 #[derive(BorshStorageKey)]
@@ -94,14 +104,35 @@ pub(crate) fn borsh_len<T: near_sdk::borsh::BorshSerialize>(value: &T) -> usize 
 /// Storage of the root state record beyond its value: the `STATE` key and the record overhead.
 const STATE_RECORD_OVERHEAD: usize = 5 + 40;
 
-/// Outcome of the single promise a callback waits for. `None` when the method was not called
-/// as a callback of exactly one promise. Never panics, so callbacks can always finish.
-pub(crate) fn promise_succeeded() -> Option<bool> {
+/// Result of the single promise a callback waits for.
+pub(crate) enum PromiseOutcome {
+    /// The method was not called as a callback of exactly one promise.
+    Missing,
+    Failed,
+    /// The value, or `None` when it is longer than the limit the caller asked for.
+    Succeeded(Option<Vec<u8>>),
+}
+
+/// Reads the promise result with a length limit. Never panics, so callbacks can always finish.
+pub(crate) fn promise_outcome(max_len: usize) -> PromiseOutcome {
     if env::promise_results_count() != 1 {
-        return None;
+        return PromiseOutcome::Missing;
     }
+    match env::promise_result_checked(0, max_len) {
+        Ok(value) => PromiseOutcome::Succeeded(Some(value)),
+        Err(PromiseError::TooLong(_)) => PromiseOutcome::Succeeded(None),
+        Err(_) => PromiseOutcome::Failed,
+    }
+}
+
+/// `None` when the method was not called as a callback of exactly one promise.
+pub(crate) fn promise_succeeded() -> Option<bool> {
     // A length limit of 0 avoids copying the result. A longer result still means success.
-    Some(matches!(env::promise_result_checked(0, 0), Ok(_) | Err(PromiseError::TooLong(_))))
+    match promise_outcome(0) {
+        PromiseOutcome::Missing => None,
+        PromiseOutcome::Failed => Some(false),
+        PromiseOutcome::Succeeded(_) => Some(true),
+    }
 }
 
 #[near]
@@ -154,11 +185,7 @@ impl Guard {
     /// `None` when the token is not in the policy.
     pub fn get_token_status(&self, token_id: TokenKey) -> Option<TokenStatus> {
         let limit = self.policy.token_limit(&token_id)?;
-        let spent = self
-            .token_usage
-            .get(&token_id)
-            .map(|u| u.rolled(self.current_period_start()).spent_in_period.0)
-            .unwrap_or(0);
+        let spent = self.spent_in_period(&token_id);
         Some(TokenStatus {
             budget: U128(self.budget_of(&token_id)),
             max_per_payment: limit.max_per_payment,
@@ -202,6 +229,19 @@ impl Guard {
 
     fn current_period_start(&self) -> u64 {
         current_period_start(now_sec(), self.policy.period_anchor, self.policy.period_seconds)
+    }
+
+    /// Spending of `token_id` in the current period. A finished period reads as zero.
+    fn token_usage_now(&self, token_id: &TokenKey) -> PeriodUsage {
+        let start = self.current_period_start();
+        self.token_usage
+            .get(token_id)
+            .map(|u| u.rolled(start))
+            .unwrap_or(PeriodUsage { period_start: start, spent_in_period: U128(0) })
+    }
+
+    fn spent_in_period(&self, token_id: &TokenKey) -> u128 {
+        self.token_usage_now(token_id).spent_in_period.0
     }
 
     fn budget_of(&self, token_id: &TokenKey) -> u128 {
