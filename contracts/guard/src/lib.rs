@@ -24,13 +24,14 @@ use near_sdk::json_types::U128;
 use near_sdk::store::{LookupMap, LookupSet};
 use near_sdk::{env, near, require, AccountId, BorshStorageKey, Gas, PanicOnDefault, PromiseError};
 
-// Starting points. The sandbox gas tests (E2-S2) measure the worst case and set the final values.
-pub(crate) const GAS_FT_TRANSFER: Gas = Gas::from_tgas(15);
-pub(crate) const GAS_ON_WITHDRAW: Gas = Gas::from_tgas(15);
-pub(crate) const GAS_FAIL_WITHDRAWAL: Gas = Gas::from_tgas(5);
-pub(crate) const GAS_ON_PAYOUT: Gas = Gas::from_tgas(10);
-pub(crate) const GAS_ADD_PROPOSAL: Gas = Gas::from_tgas(25);
-pub(crate) const GAS_ON_ESCALATION: Gas = Gas::from_tgas(10);
+// Static gas of the outgoing calls and callbacks. `sandbox-tests/tests/gas.rs` measures each one
+// in its worst case and fails when one burns more than half of what is reserved here.
+pub const GAS_FT_TRANSFER: Gas = Gas::from_tgas(15);
+pub const GAS_ON_WITHDRAW: Gas = Gas::from_tgas(15);
+pub const GAS_FAIL_WITHDRAWAL: Gas = Gas::from_tgas(5);
+pub const GAS_ON_PAYOUT: Gas = Gas::from_tgas(10);
+pub const GAS_ADD_PROPOSAL: Gas = Gas::from_tgas(25);
+pub const GAS_ON_ESCALATION: Gas = Gas::from_tgas(10);
 
 #[near(serializers = [borsh])]
 #[derive(BorshStorageKey)]
