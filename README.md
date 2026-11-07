@@ -96,7 +96,7 @@ The setup runs on testnet under `macstian-tripwire.testnet`:
 
 | Account | Role | Code hash |
 | --- | --- | --- |
-| [`guard.macstian-tripwire.testnet`](https://testnet.nearblocks.io/address/guard.macstian-tripwire.testnet) | The guard. No access keys, 1 NEAR and 1,000 USDC budget | `E9uSivdvoVBBsKsqJG1LhfrxxpZCGCCtsRXqc8csTFtq` |
+| [`guard.macstian-tripwire.testnet`](https://testnet.nearblocks.io/address/guard.macstian-tripwire.testnet) | The guard. No access keys, funded with 1 NEAR and 1,000 USDC | `E9uSivdvoVBBsKsqJG1LhfrxxpZCGCCtsRXqc8csTFtq` |
 | [`dao.macstian-tripwire.testnet`](https://testnet.nearblocks.io/address/dao.macstian-tripwire.testnet) | Sputnik DAO v2 3.2, the code the mainnet factory deploys | `DtHZA1mUmGYeScEaUoUZYQGGFHSMpnjMCvkr5U9hJXuF` |
 | [`usdc.macstian-tripwire.testnet`](https://testnet.nearblocks.io/address/usdc.macstian-tripwire.testnet) | Mock USDC, 6 decimals | `BS9RxQ4HKy5yW9xVnHTKwzoqbdSBqiAwSRARaa9ypSTw` |
 | [`council.macstian-tripwire.testnet`](https://testnet.nearblocks.io/address/council.macstian-tripwire.testnet) | Only council member, also the guardian | |
@@ -111,6 +111,15 @@ The setup runs on testnet under `macstian-tripwire.testnet`:
 | `near account list-keys agent.macstian-tripwire.testnet network-config testnet now` | The agent key: `only do ["request_payment"] function calls on guard.macstian-tripwire.testnet with an allowance of 0.25 NEAR` |
 | `near contract call-function as-read-only guard.macstian-tripwire.testnet get_status json-args '{}' network-config testnet now` | The policy, the budgets, `"frozen": false` and this period's spending |
 | `near contract call-function as-read-only dao.macstian-tripwire.testnet get_policy json-args '{}' network-config testnet now` | The `GuardRequestor` role with only `transfer:AddProposal` for the guard |
+| `near contract call-function as-read-only dao.macstian-tripwire.testnet get_proposal json-args '{"id":2}' network-config testnet now` | The proposal the guard filed for the 450 USDC invoice below, a Transfer to the vendor, `Approved` |
+
+Sample transactions from 7.11. The agent signed the first two with its function call key:
+
+| Step | Transaction | Result |
+| --- | --- | --- |
+| The agent asks for 80 USDC, inside the policy | [`59AYNpYd…`](https://testnet.nearblocks.io/txns/59AYNpYdXF6cavFp4zG9YWT4TdpGjwVkry8XWnPtaNG7) | `Paid`. The guard pays the vendor at once from its budget. The `payment_executed` event shows 80 of the 300 USDC daily cap spent |
+| The agent asks for 450 USDC, over the 100 USDC cap | [`AdMYZk9P…`](https://testnet.nearblocks.io/txns/AdMYZk9PZ8oRnBSLUq4ogSqW2peYWgubJ43CuQS6g9HF) | `Escalated`. The guard pays nothing and files Transfer proposal 2 in the DAO with the reason `EXCEEDS_PER_PAYMENT_CAP` |
+| The council approves proposal 2 | [`6jNypsob…`](https://testnet.nearblocks.io/txns/6jNypsobHeUCwmd76R6CGLDvV78efAfVHbdbiDvDixYn) | The DAO pays the 450 USDC from its own treasury |
 
 To build the same setup under your own account, move the committed `deployments/testnet.json` away and run `scripts/deploy-testnet.sh <master account>`. It checks everything it can before the first transaction and writes a new `deployments/testnet.json`. Steps and balances: `sandbox-tests/README.md`, section Testnet.
 
