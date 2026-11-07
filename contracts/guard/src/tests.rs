@@ -1,30 +1,108 @@
-use near_sdk::test_utils::VMContextBuilder;
-use near_sdk::{testing_env, NearToken};
+use near_sdk::mock::{MockAction, Receipt};
+use near_sdk::test_utils::{get_created_receipts, get_logs, VMContextBuilder};
+use near_sdk::{serde_json, testing_env, NearToken, PromiseResult};
 
 use super::*;
 
+mod funding;
+mod governance;
+
+const NEAR: u128 = 1_000_000_000_000_000_000_000_000;
 const NOW_SEC: u64 = 1_762_300_000;
+const GUARD: &str = "guard.test.near";
+const DAO: &str = "dao.sputnik-dao.test.near";
+const AGENT: &str = "agent.test.near";
+const GUARDIAN: &str = "guardian.test.near";
+const USDC: &str = "usdc.test.near";
 
 fn acc(id: &str) -> AccountId {
     id.parse().unwrap()
 }
 
 fn usdc() -> AccountId {
-    acc("usdc.test.near")
+    acc(USDC)
+}
+
+/// 10 NEAR on the account and 1 000 bytes of storage (0.01 NEAR). The near-sdk default is
+/// 300 KiB, which would lock about 3 NEAR and blur the reserve checks.
+fn context(predecessor: &str) -> VMContextBuilder {
+    let mut ctx = VMContextBuilder::new();
+    ctx.current_account_id(acc(GUARD))
+        .predecessor_account_id(acc(predecessor))
+        .block_timestamp(NOW_SEC * 1_000_000_000)
+        .account_balance(NearToken::from_near(10))
+        .storage_usage(1_000);
+    ctx
 }
 
 fn setup() {
-    let mut ctx = VMContextBuilder::new();
-    ctx.current_account_id(acc("guard.test.near"))
-        .predecessor_account_id(acc("guard.test.near"))
-        .block_timestamp(NOW_SEC * 1_000_000_000)
-        .account_balance(NearToken::from_near(10));
-    testing_env!(ctx.build());
+    testing_env!(context(GUARD).build());
+}
+
+/// The next call comes from `predecessor`. Contract storage carries over, logs start empty.
+fn call_as(predecessor: &str) {
+    testing_env!(context(predecessor).build());
+}
+
+fn call_at(predecessor: &str, now_sec: u64) {
+    testing_env!(context(predecessor).block_timestamp(now_sec * 1_000_000_000).build());
+}
+
+fn call_with_deposit(predecessor: &str, deposit: NearToken) {
+    testing_env!(context(predecessor).attached_deposit(deposit).build());
+}
+
+fn call_with_balance(predecessor: &str, balance: NearToken) {
+    testing_env!(context(predecessor).account_balance(balance).build());
+}
+
+/// The next call is a callback of one promise that ended with `result`.
+fn callback_with(result: PromiseResult) {
+    testing_env!(
+        context(GUARD).build(),
+        near_sdk::test_vm_config(),
+        near_sdk::RuntimeFeesConfig::test(),
+        Default::default(),
+        vec![result],
+    );
+}
+
+/// NEP-297 events logged by the last call.
+fn events() -> Vec<serde_json::Value> {
+    get_logs()
+        .iter()
+        .filter_map(|line| line.strip_prefix("EVENT_JSON:"))
+        .map(|json| serde_json::from_str(json).unwrap())
+        .collect()
+}
+
+/// Method, JSON args, deposit and static gas of a receipt with one function call.
+fn function_call(receipt: &Receipt) -> (String, serde_json::Value, NearToken, Gas) {
+    let [MockAction::FunctionCallWeight { method_name, args, attached_deposit, prepaid_gas, .. }] =
+        receipt.actions.as_slice()
+    else {
+        panic!("expected one function call, got {:?}", receipt.actions);
+    };
+    (
+        String::from_utf8(method_name.clone()).unwrap(),
+        serde_json::from_slice(args).unwrap(),
+        *attached_deposit,
+        *prepaid_gas,
+    )
+}
+
+fn only_event() -> serde_json::Value {
+    let mut events = events();
+    assert_eq!(events.len(), 1, "expected one event, got {events:?}");
+    let event = events.remove(0);
+    assert_eq!(event["standard"], "tripwire");
+    assert_eq!(event["version"], "1.0.0");
+    event
 }
 
 fn policy() -> Policy {
     Policy {
-        agents: vec![acc("agent.test.near")],
+        agents: vec![acc(AGENT)],
         recipients: vec![acc("hosting.test.near")],
         token_limits: vec![TokenLimit {
             token_id: Some(usdc()),
@@ -34,7 +112,7 @@ fn policy() -> Policy {
         period_seconds: 86_400,
         period_anchor: NOW_SEC - 3_600,
         expires_at: Some(NOW_SEC + 30 * 86_400),
-        guardian: Some(acc("guardian.test.near")),
+        guardian: Some(acc(GUARDIAN)),
         max_payments_per_period: 20,
         max_escalations_per_period: 5,
         proposal_bond: NearToken::from_yoctonear(0),
@@ -44,7 +122,7 @@ fn policy() -> Policy {
 
 fn guard_with(policy: Policy) -> Guard {
     setup();
-    Guard::new(acc("dao.sputnik-dao.test.near"), policy)
+    Guard::new(acc(DAO), policy)
 }
 
 #[test]
@@ -151,11 +229,43 @@ fn rejects_expiry_in_the_past() {
 #[test]
 #[should_panic(expected = "ERR_INVALID_POLICY: guard account")]
 fn rejects_guard_as_recipient() {
-    guard_with(Policy { recipients: vec![acc("guard.test.near")], ..policy() });
+    guard_with(Policy { recipients: vec![acc(GUARD)], ..policy() });
 }
 
 #[test]
 #[should_panic(expected = "ERR_INVALID_POLICY: guard account")]
 fn rejects_guard_as_agent() {
-    guard_with(Policy { agents: vec![acc("guard.test.near")], ..policy() });
+    guard_with(Policy { agents: vec![acc(GUARD)], ..policy() });
+}
+
+#[test]
+#[should_panic(expected = "ERR_INVALID_POLICY: agent in recipients")]
+fn rejects_an_agent_that_is_also_a_recipient() {
+    let recipients = vec![acc("hosting.test.near"), acc(AGENT)];
+    guard_with(Policy { recipients, ..policy() });
+}
+
+/// `new` with this account balance. 1 000 bytes of storage lock 0.01 NEAR of it.
+fn init_with_balance(yocto: u128) -> Guard {
+    testing_env!(context(GUARD).account_balance(NearToken::from_yoctonear(yocto)).build());
+    Guard::new(acc(DAO), policy())
+}
+
+#[test]
+#[should_panic(expected = "ERR_INSUFFICIENT_NEAR_RESERVE")]
+fn init_needs_the_reserve() {
+    init_with_balance(2 * NEAR);
+}
+
+#[test]
+#[should_panic(expected = "ERR_INSUFFICIENT_NEAR_RESERVE")]
+fn init_counts_the_storage_of_its_own_state() {
+    // 0.002 NEAR above the 2 NEAR reserve is less than the state itself needs.
+    init_with_balance(2 * NEAR + NEAR / 100 + NEAR / 500);
+}
+
+#[test]
+fn init_passes_with_room_for_its_state() {
+    let guard = init_with_balance(2 * NEAR + NEAR / 50);
+    assert_eq!(guard.get_status().near_budget, U128(0));
 }

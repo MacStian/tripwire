@@ -79,7 +79,8 @@ impl FungibleTokenResolver for MockFt {
         receiver_id: AccountId,
         amount: U128,
     ) -> U128 {
-        let (used, burned) = self.token.internal_ft_resolve_transfer(&sender_id, receiver_id, amount);
+        let (used, burned) =
+            self.token.internal_ft_resolve_transfer(&sender_id, receiver_id, amount);
         if burned > 0 {
             log!("Account @{} burned {}", sender_id, burned);
         }
