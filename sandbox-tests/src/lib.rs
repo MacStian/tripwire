@@ -10,6 +10,7 @@ pub mod deploy;
 
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::Engine;
@@ -87,6 +88,9 @@ pub async fn spendable(network: &NetworkConfig, id: &AccountId) -> Result<NearTo
 
 const STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(10);
 const NO_DEPOSIT: NearToken = NearToken::from_yoctonear(0);
+/// near-sandbox sends `sandbox_fast_forward` without a time limit, so a node that stops
+/// producing blocks halfway would hold the test forever. A forward here takes a few seconds.
+const FAST_FORWARD_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// NEAR each account gets when the setup creates it.
 #[derive(Clone, Copy, Debug)]
@@ -918,7 +922,11 @@ impl Harness {
             if now >= target_sec {
                 return Ok(());
             }
-            self.sandbox.fast_forward(target_sec - now).await?;
+            let blocks = target_sec - now;
+            let forward = self.sandbox.fast_forward(blocks);
+            tokio::time::timeout(FAST_FORWARD_TIMEOUT, forward).await.with_context(|| {
+                format!("the local node stopped while it fast forwarded {blocks} blocks")
+            })??;
         }
         bail!("the chain clock did not reach {target_sec}")
     }
