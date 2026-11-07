@@ -171,15 +171,13 @@ pub fn check(outcome: &ExecutionFinalResult, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Fails unless the transaction failed with exactly this contract panic, for example
-/// `ERR_GUARD_FROZEN`.
+/// Fails unless a receipt of the transaction failed with exactly this contract panic, for
+/// example `ERR_GUARD_FROZEN`. In a DAO vote the vote itself succeeds and only the receipt on
+/// the guard fails.
 pub fn check_panic(outcome: &ExecutionFinalResult, message: &str) -> Result<()> {
     let failures = format!("{:?}", outcome.failures());
     let expected = format!("{:?}", format!("Smart contract panicked: {message}"));
-    ensure!(
-        outcome.is_failure() && failures.contains(&expected),
-        "expected the panic {message}, got {failures}"
-    );
+    ensure!(failures.contains(&expected), "expected the panic {message}, got {failures}");
     Ok(())
 }
 
@@ -315,7 +313,7 @@ impl Harness {
         let args = json!({ "symbol": "USDC", "decimals": USDC_DECIMALS });
         self.deploy(&self.usdc, mock_ft_wasm(), args).await?;
         for holder in [&self.dao, &self.guard, &self.vendor] {
-            self.storage_deposit(holder).await?;
+            self.register(&self.usdc, holder).await?;
         }
         let args = json!({ "account_id": self.dao, "amount": DAO_USDC.to_string() });
         let gas = NearGas::from_tgas(30);
@@ -384,19 +382,54 @@ impl Harness {
         check(&full(result)?, &format!("deploying {id}"))
     }
 
-    async fn storage_deposit(&self, holder: &AccountId) -> Result<()> {
+    /// Pays storage for `holder` on a mock token, from the council.
+    pub async fn register(&self, token: &AccountId, holder: &AccountId) -> Result<()> {
         let args = json!({ "account_id": holder, "registration_only": true });
         let gas = NearGas::from_tgas(30);
-        let outcome = self
-            .call(&self.council, &self.usdc, "storage_deposit", args, STORAGE_DEPOSIT, gas)
-            .await?;
-        check(&outcome, &format!("registering {holder} on the token"))
+        let outcome =
+            self.call(&self.council, token, "storage_deposit", args, STORAGE_DEPOSIT, gas).await?;
+        check(&outcome, &format!("registering {holder} on {token}"))
+    }
+
+    /// Creates another mock token at `id`, with storage for the guard and the council and
+    /// `council_balance` minted to the council. It is in no guard policy.
+    pub async fn create_token(&self, id: &str, council_balance: u128) -> Result<AccountId> {
+        let token = account(id)?;
+        self.sandbox
+            .create_account(id.parse()?)
+            .initial_balance(NearToken::from_near(20))
+            .send()
+            .await
+            .with_context(|| format!("creating {id}"))?;
+        let args = json!({ "symbol": "FAKE", "decimals": USDC_DECIMALS });
+        self.deploy(&token, mock_ft_wasm(), args).await?;
+        for holder in [&self.guard, &self.council] {
+            self.register(&token, holder).await?;
+        }
+        let args = json!({ "account_id": self.council, "amount": council_balance.to_string() });
+        let gas = NearGas::from_tgas(30);
+        let outcome = self.call(&token, &token, "mint", args, NO_DEPOSIT, gas).await?;
+        check(&outcome, &format!("minting {id} to the council"))?;
+        Ok(token)
     }
 
     /// Current block time in seconds, the clock the guard sees.
     pub async fn now_sec(&self) -> Result<u64> {
         let block = Chain::block().fetch_from(&self.network).await?;
         Ok(block.header.timestamp / 1_000_000_000)
+    }
+
+    /// Moves the chain clock to at least `target_sec` with sandbox fast forward, which
+    /// produces the blocks at once instead of waiting for real time.
+    pub async fn advance_to(&self, target_sec: u64) -> Result<()> {
+        for _ in 0..30 {
+            let now = self.now_sec().await?;
+            if now >= target_sec {
+                return Ok(());
+            }
+            self.sandbox.fast_forward(target_sec - now).await?;
+        }
+        bail!("the chain clock did not reach {target_sec}")
     }
 
     pub async fn view<T>(&self, contract: &AccountId, method: &str, args: Value) -> Result<T>
@@ -574,16 +607,15 @@ impl Harness {
             .await
     }
 
-    /// Proposes a single FunctionCall from the DAO and approves it. Returns the proposal id and
-    /// the outcome of the vote that executed it, failed or not.
-    pub async fn dao_function_call_outcome(
+    /// Files a proposal for a single FunctionCall from the DAO, without voting on it.
+    pub async fn propose_function_call(
         &self,
         receiver: &AccountId,
         method: &str,
         args: &Value,
         deposit_yocto: u128,
         gas: NearGas,
-    ) -> Result<(u64, ExecutionFinalResult)> {
+    ) -> Result<u64> {
         let encoded = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(args)?);
         let kind = json!({ "FunctionCall": {
             "receiver_id": receiver,
@@ -594,7 +626,20 @@ impl Harness {
                 "gas": gas.as_gas().to_string(),
             }],
         } });
-        let id = self.propose(&format!("Call {method} on {receiver}"), kind).await?;
+        self.propose(&format!("Call {method} on {receiver}"), kind).await
+    }
+
+    /// Proposes a single FunctionCall from the DAO and approves it. Returns the proposal id and
+    /// the outcome of the vote that executed it, failed or not.
+    pub async fn dao_function_call_outcome(
+        &self,
+        receiver: &AccountId,
+        method: &str,
+        args: &Value,
+        deposit_yocto: u128,
+        gas: NearGas,
+    ) -> Result<(u64, ExecutionFinalResult)> {
+        let id = self.propose_function_call(receiver, method, args, deposit_yocto, gas).await?;
         Ok((id, self.approve(id).await?))
     }
 
@@ -621,6 +666,16 @@ impl Harness {
         Ok(keys.data.into_iter().map(|(public_key, _)| public_key).collect())
     }
 
+    /// Id the DAO gives the next proposal.
+    pub async fn next_proposal_id(&self) -> Result<u64> {
+        self.view(&self.dao, "get_last_proposal_id", json!({})).await
+    }
+
+    /// Bytes of storage the account uses.
+    pub async fn storage_usage(&self, id: &AccountId) -> Result<u64> {
+        Ok(Account(id.clone()).view().fetch_from(&self.network).await?.data.storage_usage)
+    }
+
     pub async fn guard_status(&self) -> Result<Value> {
         self.view(&self.guard, "get_status", json!({})).await
     }
@@ -632,8 +687,13 @@ impl Harness {
 
     /// USDC balance in base units.
     pub async fn usdc_balance(&self, holder: &AccountId) -> Result<u128> {
+        self.ft_balance(&self.usdc, holder).await
+    }
+
+    /// Balance on any NEP-141 token in base units.
+    pub async fn ft_balance(&self, token: &AccountId, holder: &AccountId) -> Result<u128> {
         let balance: String =
-            self.view(&self.usdc, "ft_balance_of", json!({ "account_id": holder })).await?;
+            self.view(token, "ft_balance_of", json!({ "account_id": holder })).await?;
         Ok(balance.parse()?)
     }
 
