@@ -171,6 +171,18 @@ pub fn check(outcome: &ExecutionFinalResult, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fails unless the transaction failed with exactly this contract panic, for example
+/// `ERR_GUARD_FROZEN`.
+pub fn check_panic(outcome: &ExecutionFinalResult, message: &str) -> Result<()> {
+    let failures = format!("{:?}", outcome.failures());
+    let expected = format!("{:?}", format!("Smart contract panicked: {message}"));
+    ensure!(
+        outcome.is_failure() && failures.contains(&expected),
+        "expected the panic {message}, got {failures}"
+    );
+    Ok(())
+}
+
 /// The `tripwire` events of all receipts, in execution order, as the NEP-297 JSON objects.
 pub fn events(outcome: &ExecutionFinalResult) -> Vec<Value> {
     outcome
@@ -455,6 +467,49 @@ impl Harness {
             .send_to(&self.network)
             .await?;
         full(result)
+    }
+
+    /// Signs as the agent with its function call key and sends the transaction with a raw
+    /// `send_tx`, so a transaction the runtime refuses comes back with the full reason
+    /// (near-api keeps only the kind of that error). Returns the runtime's `InvalidTxError`
+    /// and fails when the transaction was accepted.
+    pub async fn agent_refusal(
+        &self,
+        contract: &AccountId,
+        method: &str,
+        args: Value,
+        deposit: NearToken,
+        gas: NearGas,
+    ) -> Result<Value> {
+        let signed = Contract(contract.clone())
+            .call_function(method, args)
+            .transaction()
+            .deposit(deposit)
+            .gas(gas)
+            .with_signer(self.agent.clone(), self.agent_signer.clone())
+            .presign_with(&self.network)
+            .await?
+            .transaction
+            .signed()
+            .context("the transaction was not signed")?;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(near_sdk::borsh::to_vec(&signed)?);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "tripwire",
+            "method": "send_tx",
+            "params": { "signed_tx_base64": encoded, "wait_until": "EXECUTED_OPTIMISTIC" },
+        });
+        let response: Value = reqwest::Client::new()
+            .post(&self.sandbox.rpc_addr)
+            .json(&request)
+            .send()
+            .await?
+            .json()
+            .await?;
+        let reason = &response["error"]["data"]["TxExecutionError"]["InvalidTxError"];
+        ensure!(!reason.is_null(), "{contract}.{method} was not refused: {response}");
+        Ok(reason.clone())
     }
 
     /// Files a proposal from the council with the DAO bond and returns its id.
