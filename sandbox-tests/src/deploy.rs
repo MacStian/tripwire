@@ -142,7 +142,12 @@ pub async fn account_exists(network: &NetworkConfig, id: &AccountId) -> Result<b
 
 /// Writes a key file in the near CLI format, readable by the owner only, and syncs it to disk.
 /// Never overwrites.
-fn write_key_file(path: &Path, id: &AccountId, public_key: &str, private_key: &str) -> Result<()> {
+pub fn write_key_file(
+    path: &Path,
+    id: &AccountId,
+    public_key: &str,
+    private_key: &str,
+) -> Result<()> {
     let body = json!({ "account_id": id, "public_key": public_key, "private_key": private_key });
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);

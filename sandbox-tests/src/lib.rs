@@ -6,6 +6,7 @@
 //! testnet (see [`deploy`]). [`Harness::start`] runs it on a fresh local node. Every test starts
 //! its own node, so tests never share state.
 
+pub mod demo;
 pub mod deploy;
 
 use std::ops::Deref;
@@ -884,10 +885,16 @@ impl Harness {
     /// Starts a node, creates the accounts under [`MASTER`] with the genesis key and the NEAR
     /// of `opts.balances`, and runs [`Deployment::set_up`] on them.
     pub async fn start(opts: Options) -> Result<Self> {
+        Self::start_under(MASTER, opts).await
+    }
+
+    /// [`Harness::start`] with the accounts under `master`. A state patch can create any
+    /// account, so the demo runs locally under the same names as on testnet.
+    pub async fn start_under(master: &str, opts: Options) -> Result<Self> {
         let sandbox = Sandbox::start_sandbox().await.context("starting the sandbox")?;
         let network = NetworkConfig::from_rpc_url("sandbox", sandbox.rpc_addr.parse()?);
         let signer = Signer::from_secret_key(DEFAULT_GENESIS_ACCOUNT_PRIVATE_KEY.parse()?)?;
-        let deployment = Deployment::new(network, account(MASTER)?, signer, opts.proposal_bond)?;
+        let deployment = Deployment::new(network, account(master)?, signer, opts.proposal_bond)?;
         let harness = Self { sandbox, deployment };
         for (id, balance) in harness.balances(&opts.balances) {
             harness.create_account(id, balance).await?;

@@ -17,4 +17,5 @@ near-sdk = { workspace = true, features = ["non-contract-usage"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde = "1"
 serde_json = "1"
+tripwire-agent = { path = "../agent" }
 tokio = { version = "1", features = ["full"] }
